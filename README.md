@@ -85,6 +85,20 @@ node smoke.mjs
 `smoke.mjs` covers discovery, DCR, the redirect allowlist, PKCE (including a deliberate mismatch),
 single-use codes, refresh, per-user PAT injection, header round-tripping, and unbuffered SSE.
 
+## Deploying
+
+```bash
+railway up --service mcp-github-proxy --detach
+```
+
+Builds via the `Dockerfile`, deliberately. Railway's default builder (railpack) fails this service
+with `failed to solve: secret RAILWAY_GIT_REPO_OWNER not found` — its generated plan declares the
+`RAILWAY_GIT_*` build secrets, which only exist when the service's source is a connected GitHub
+repo, not a CLI tarball upload. Deleting the `Dockerfile` brings that failure back unless the
+service is first connected to a GitHub source.
+
+`PORT` is pinned to 3000 to match the generated domain's target port.
+
 ## Notes
 
 - Claude's token never goes upstream; no PAT ever comes back down.
