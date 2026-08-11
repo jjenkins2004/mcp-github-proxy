@@ -7,9 +7,9 @@ Claude authenticates with OAuth 2.1 + DCR (which the connector form requires). E
 consent secret selects their own GitHub PAT and their own repo. Zero runtime dependencies, no
 database, all state in memory.
 
-This is **not** a GitHub MCP passthrough. It exposes three tools and nothing else.
+This is **not** a GitHub MCP passthrough. It exposes five tools and nothing else.
 
-## The three tools
+## The tools
 
 | Tool | What it does |
 | --- | --- |
