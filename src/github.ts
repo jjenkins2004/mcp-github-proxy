@@ -184,7 +184,7 @@ export async function commitEdits(user: User, message: string, edits: Edit[]): P
   const branch = await branchOf(user);
   const attempt = async (): Promise<CommitResult | "retry"> => {
     /* ---- PHASE 1: PLAN. Only GETs. ---- */
-    const ref = await gh(user, `/repos/${user.repo}/git/ref/heads/${encodeURIComponent(branch)}`);
+    const ref = await readHeadRef(user, branch);
     if (ref.status === 409 && /empty/i.test(JSON.stringify(ref.body))) return bootstrapEmptyRepo(user, branch, message, edits);
     if (ref.status !== 200) classify(user, ref, "reading the branch ref");
     const headSha: string = ref.body.object.sha;
@@ -327,6 +327,7 @@ export async function commitEdits(user: User, message: string, edits: Edit[]): P
     }
     if (patch.status !== 200) classify(user, patch, "updating the branch");
 
+    lastCommit.set(user.id, { sha: newCommit.body.sha, at: Date.now() });
     return {
       sha: newCommit.body.sha,
       url: newCommit.body.html_url || `https://github.com/${user.repo}/commit/${newCommit.body.sha}`,
@@ -348,6 +349,28 @@ export async function commitEdits(user: User, message: string, edits: Edit[]): P
     bail(`${user.repo}@${branch} is moving faster than this commit can land — two pushes landed underneath it. Nothing was committed.`);
   }
   return second;
+}
+
+/* Read-your-own-writes. GitHub's ref read goes briefly stale immediately after a push, so a
+   commit made seconds ago may not be visible yet. Without this, an edit that follows another
+   edit plans against the PREVIOUS head: expect_sha checks compare against superseded blobs and
+   a file created moments ago reads as "not present on the branch". Only ever waits when this
+   server itself just committed and the ref has not caught up. */
+const lastCommit = new Map<string, { sha: string; at: number }>();
+const STALE_WINDOW_MS = 20_000;
+
+async function readHeadRef(user: User, branch: string): Promise<GhRes> {
+  let r = await gh(user, `/repos/${user.repo}/git/ref/heads/${encodeURIComponent(branch)}`);
+  const mine = lastCommit.get(user.id);
+  if (!mine || Date.now() - mine.at > STALE_WINDOW_MS) return r;
+
+  for (let i = 0; i < 4 && r.status === 200 && r.body?.object?.sha !== mine.sha; i++) {
+    // A colleague pushing on top also produces a different sha; that is legitimate and we
+    // simply proceed once the retries are spent.
+    await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+    r = await gh(user, `/repos/${user.repo}/git/ref/heads/${encodeURIComponent(branch)}`);
+  }
+  return r;
 }
 
 function isWellFormed(s: string): boolean {
@@ -470,6 +493,7 @@ async function bootstrapEmptyRepo(user: User, branch: string, message: string, e
   const ref = await gh(user, `/repos/${user.repo}/git/refs`, { method: "POST", body: { ref: `refs/heads/${branch}`, sha: commit.body.sha } });
   if (ref.status !== 201) classify(user, ref, "creating the branch");
 
+  lastCommit.set(user.id, { sha: commit.body.sha, at: Date.now() });
   return {
     sha: commit.body.sha,
     url: commit.body.html_url || `https://github.com/${user.repo}/commit/${commit.body.sha}`,

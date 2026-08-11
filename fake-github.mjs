@@ -340,6 +340,14 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
       const name = rest.slice(2).join("/"); // "heads/main"
       const sha = repo.refs.get(name);
       if (!sha) return notFound(res);
+      // Real GitHub serves a briefly stale ref right after a push; this reproduces that.
+      if (faults.has("stale-ref")) {
+        takeFault("stale-ref");
+        const cur = state.commits.get(sha);
+        if (cur?.parents?.length) {
+          return json(res, 200, { ref: `refs/${name}`, object: { sha: cur.parents[0], type: "commit" } });
+        }
+      }
       return json(res, 200, { ref: `refs/${name}`, object: { sha, type: "commit" } });
     }
 

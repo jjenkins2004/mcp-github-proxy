@@ -304,6 +304,28 @@ const prot = await call(A, "commit_edits", { message: "m", edits: [{ op: "write"
 ok("branch protection is not treated as a collision", prot.isError && /pull request/i.test(prot.text), prot.text);
 ok("branch protection does not retry", gh.log.filter((r) => r.method === "PATCH").length === 1);
 
+/* ---------------- read-your-own-writes ---------------- */
+
+// GitHub serves a briefly stale ref right after a push. A second edit that plans against the
+// PREVIOUS head sees superseded blobs, and a file created moments ago reads as "not present".
+gh.seed("alice/notes", { files: { "seq.md": "# Seq\n\nbody\n" } });
+gh.reset();
+const first = await call(A, "commit_edits", { message: "one", edits: [{ op: "write", path: "seq2.md", content: "# Two\n\nx\n" }] });
+ok("first commit in a sequence lands", !first.isError, first.text);
+gh.fault("stale-ref", { times: 2 });
+const second = await call(A, "commit_edits", {
+  message: "two", edits: [{ op: "str_replace", path: "seq2.md", old_string: "x", new_string: "y" }],
+});
+ok("an edit right after a commit survives a stale ref read", !second.isError, second.text);
+ok("the stale ref was retried rather than trusted",
+  gh.log.filter((r) => r.method === "GET" && /\/git\/ref\//.test(r.path)).length >= 3);
+ok("the follow-up edit actually landed", gh.state.readFile("alice/notes", "seq2.md").toString().includes("y"));
+
+const sdel = /blob sha: ([0-9a-f]{40})/.exec((await call(A, "read_md", { path: "seq2.md" })).text)[1];
+gh.fault("stale-ref", { times: 2 });
+ok("a delete right after a commit is not spuriously rejected",
+  !(await call(A, "commit_edits", { message: "three", edits: [{ op: "delete", path: "seq2.md", expect_sha: sdel }] })).isError);
+
 /* ---------------- empty repo bootstrap ---------------- */
 
 gh.seed("alice/notes", { files: {} });
@@ -358,6 +380,109 @@ await call(A, "commit_edits", { message: "one", edits: [{ op: "str_replace", pat
 await call(A, "commit_edits", { message: "two", edits: [{ op: "str_replace", path: "c2.md", old_string: "b", new_string: "B" }] });
 const third = await call(A, "commit_edits", { message: "three", edits: [{ op: "str_replace", path: "c3.md", old_string: "c", new_string: "C" }] });
 ok("three single-file commits in a row nudge toward batching", third.text.includes("edits array"), third.text.slice(-300));
+
+/* ================= REGRESSION GUARDS =================
+   One named test per bug actually shipped or caught in this project. Each fails if its fix
+   is reverted. Do not delete these; they are the record of what has already gone wrong. */
+
+// BUG 1 (shipped to production): the consent page's hidden fields omitted response_type, so the
+// GET rendered fine and submitting the secret POSTed without it -> {"error":"unsupported_response_type"}.
+// The original smoke test missed it by building its own POST body instead of using the rendered form.
+{
+  const c = await (await fetch(`${B}/register`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "regress", redirect_uris: [RD] }),
+  })).json();
+  const v = b64(randomBytes(32));
+  const q2 = new URLSearchParams({
+    client_id: c.client_id, redirect_uri: RD, response_type: "code",
+    code_challenge: b64(createHash("sha256").update(v).digest()),
+    code_challenge_method: "S256", state: "st", scope: "mcp",
+  });
+  const page = await (await fetch(`${B}/authorize?${q2}`)).text();
+  const f = new URLSearchParams([...page.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)].map((m) => [m[1], m[2]]));
+  ok("REGRESSION consent form carries response_type", f.get("response_type") === "code");
+  const submitted = await fetch(`${B}/authorize`, {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams([...f, ["secret", "secret-alice"]]), redirect: "manual",
+  });
+  ok("REGRESSION submitting the rendered form redirects, not unsupported_response_type", submitted.status === 302);
+  // The error re-render must be submittable too, or a wrong secret becomes a dead end.
+  const wrongPage = await (await fetch(`${B}/authorize`, {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams([...f, ["secret", "wrong"]]), redirect: "manual",
+  })).text();
+  const f2 = new URLSearchParams([...wrongPage.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)].map((m) => [m[1], m[2]]));
+  ok("REGRESSION the wrong-secret retry page carries response_type too", f2.get("response_type") === "code");
+}
+
+// BUG 2: delete-then-create on one path emitted sha:null AND kept the deleted flag, so the
+// sanctioned overwrite idiom silently REMOVED the file instead of replacing it.
+gh.seed("alice/notes", { files: { "reg2.md": "# Original\n\nold body\n" } });
+{
+  const sha2 = /blob sha: ([0-9a-f]{40})/.exec((await call(A, "read_md", { path: "reg2.md" })).text)[1];
+  gh.reset();
+  const r = await call(A, "commit_edits", {
+    message: "replace via delete+create",
+    edits: [{ op: "delete", path: "reg2.md", expect_sha: sha2 }, { op: "write", path: "reg2.md", content: "# Replaced\n\nnew body\n" }],
+  });
+  ok("REGRESSION delete-then-create replaces rather than deletes", !r.isError, r.text);
+  const onDisk = gh.state.readFile("alice/notes", "reg2.md");
+  ok("REGRESSION the file still exists after delete-then-create", !!onDisk, "file was removed");
+  ok("REGRESSION it holds the NEW content", String(onDisk).includes("# Replaced"), String(onDisk));
+  const t = gh.log.find((x) => x.method === "POST" && /\/git\/trees$/.test(x.path));
+  ok("REGRESSION the tree entry carries content, not sha:null",
+    t.body.tree.find((e) => e.path === "reg2.md")?.content !== undefined &&
+    t.body.tree.find((e) => e.path === "reg2.md")?.sha !== null);
+}
+
+// BUG 3 (found by live testing against real GitHub): the ref read is briefly stale right after a
+// push, so a second edit planned against the PREVIOUS head. A file created moments earlier came
+// back as "not present on main" and its deletion was spuriously rejected.
+gh.seed("alice/notes", { files: { "reg3.md": "# R3\n\nbody\n" } });
+{
+  gh.reset();
+  const made = await call(A, "commit_edits", { message: "create", edits: [{ op: "write", path: "reg3b.md", content: "# New\n\nz\n" }] });
+  ok("REGRESSION create lands", !made.isError, made.text);
+  const sha3 = /blob sha: ([0-9a-f]{40})/.exec((await call(A, "read_md", { path: "reg3b.md" })).text)[1];
+  gh.fault("stale-ref", { times: 2 });
+  const del = await call(A, "commit_edits", { message: "delete it", edits: [{ op: "delete", path: "reg3b.md", expect_sha: sha3 }] });
+  ok("REGRESSION deleting a just-created file is not rejected as 'not present'", !del.isError, del.text);
+  ok("REGRESSION the file is actually gone", !gh.state.readFile("alice/notes", "reg3b.md"));
+}
+
+// BUG 4: the control-character path guard was written with raw bytes in the regex, and a
+// mechanical fix double-escaped it into /[\\u0000...]/ — which matches a literal backslash and
+// NOT control characters. Both failure directions are pinned here.
+{
+  gh.reset();
+  const nul = await call(A, "commit_edits", {
+    message: "m", edits: [{ op: "write", path: "docs/a" + String.fromCharCode(0) + "b.md", content: "x" }],
+  });
+  ok("REGRESSION a NUL byte in a path is rejected", nul.isError && gh.log.length === 0, nul.text);
+  const del = await call(A, "commit_edits", {
+    message: "m", edits: [{ op: "write", path: "docs/a" + String.fromCharCode(127) + "b.md", content: "x" }],
+  });
+  ok("REGRESSION a DEL byte in a path is rejected", del.isError);
+  // ...and the guard must not over-match: an ordinary path has to still work.
+  gh.seed("alice/notes", { files: {} });
+  ok("REGRESSION the control-char guard does not reject ordinary paths",
+    !(await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "docs/plain-name.md", content: "# ok\n" }] })).isError);
+}
+
+// BUG 5: GitHub's WWW-Authenticate was forwarded by the old proxy, sending claude.ai to
+// re-authenticate against GitHub in a loop while the real cause (a dead PAT) stayed invisible.
+{
+  gh.fault("401");
+  const r = await call(A, "list_md", {});
+  ok("REGRESSION a GitHub 401 surfaces as tool-error text", r.isError && /PAT/i.test(r.text), r.text);
+  const probe = await fetch(`${B}/mcp`, {
+    method: "POST", headers: { authorization: `Bearer ${A}`, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 9999, method: "tools/call", params: { name: "list_md", arguments: {} } }),
+  });
+  ok("REGRESSION a GitHub 401 never becomes an HTTP 401 from /mcp", probe.status === 200);
+  ok("REGRESSION GitHub's WWW-Authenticate is never forwarded", !probe.headers.get("www-authenticate"));
+}
 
 /* ---------------- the ledger ---------------- */
 
