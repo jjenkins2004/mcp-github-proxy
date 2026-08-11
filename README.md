@@ -15,7 +15,20 @@ This is **not** a GitHub MCP passthrough. It exposes three tools and nothing els
 | --- | --- |
 | `list_md` | Every .md file with byte size and git blob SHA. Read-only. |
 | `read_md` | One file's exact bytes, its blob SHA, and a heading outline with line ranges. Read-only. |
+| `history` | Recent commits — who authored each, when, and the message. Optional path filter. Read-only. |
+| `show_commit` | One commit's author, message, and per-file diff. Read-only. |
 | `commit_edits` | Applies an ordered list of edits and pushes them as **one** commit. The only tool that writes. |
+
+### Who edited what
+
+Each person's own PAT is injected, so GitHub records the real human as the commit author — this
+is genuine git attribution, not anything the server synthesizes. `history` answers "who changed
+this file", `show_commit` shows the actual diff, and `git blame` works normally outside the app.
+
+Two limits worth knowing. `history(path)` does not follow renames, so commits from before a
+rename are listed under the old path — same as `git log` without `--follow`. And a commit's
+file list is paginated by GitHub at 300 files; the tool reports when it has hit that boundary
+rather than presenting a partial list as complete.
 
 `commit_edits` takes four operations:
 
@@ -111,11 +124,13 @@ Both people add the same URL; the secret each types binds their session to their
 
 ```bash
 npm install && npm run build
-node test-md.mjs        # 61 assertions: scanner, edit ops, byte fidelity — no network
+node test-md.mjs        # 92 assertions: scanner, edit ops, byte fidelity — no network
 
-# integration: 87 assertions against a stateful fake GitHub
+# integration: 168 assertions against a stateful fake GitHub
 USER1_NAME=alice USER1_SECRET=secret-alice USER1_PAT=pat-alice USER1_REPO=alice/notes \
 USER2_NAME=bob   USER2_SECRET=secret-bob   USER2_PAT=pat-bob   USER2_REPO=bob/wiki \
+USER3_NAME=carol USER3_SECRET=secret-carol USER3_PAT=pat-carol USER3_REPO=alice/notes USER3_ROOT=docs \
+USER4_NAME=dave  USER4_SECRET=secret-dave  USER4_PAT=pat-dave  USER4_REPO=alice/notes USER4_BRANCH=nope \
 JWT_SECRET=test-jwt PUBLIC_URL=http://127.0.0.1:8787 PORT=8787 \
 GITHUB_API_URL=http://127.0.0.1:8899 npm start &
 node smoke.mjs

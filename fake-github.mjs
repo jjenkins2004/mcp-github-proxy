@@ -306,6 +306,71 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
       });
     }
 
+    // 1b. GET /repos/:o/:r/commits[?path=&sha=&per_page=]  and  /commits/:sha
+    // Note: this is the REPO commits API (plural "commits" at the top level), distinct from
+    // the git-data /git/commits/:sha handled further down.
+    if (method === "GET" && rest[0] === "commits" && rest.length <= 2) {
+      const walk = (startSha) => {
+        const out = [];
+        let cur = startSha;
+        while (cur && state.commits.has(cur)) {
+          out.push(state.commits.get(cur));
+          cur = (state.commits.get(cur).parents || [])[0];
+        }
+        return out;
+      };
+      const filesOf = (c) => {
+        const before = (c.parents || [])[0] ? state.treeEntries(state.commits.get(c.parents[0]).tree) : [];
+        const after = state.treeEntries(c.tree);
+        const bm = new Map(before.map((e) => [e.path, e.sha]));
+        const am = new Map(after.map((e) => [e.path, e.sha]));
+        const out = [];
+        for (const [p, sha] of am) {
+          if (!bm.has(p)) out.push({ filename: p, status: "added", additions: 1, deletions: 0, patch: `@@ -0,0 +1 @@\n+${text(sha).split("\n")[0]}` });
+          else if (bm.get(p) !== sha) out.push({ filename: p, status: "modified", additions: 1, deletions: 1, patch: `@@ -1 +1 @@\n-${text(bm.get(p)).split("\n")[0]}\n+${text(sha).split("\n")[0]}` });
+        }
+        for (const [p, sha] of bm) if (!am.has(p)) out.push({ filename: p, status: "removed", additions: 0, deletions: 1, patch: `@@ -1 +0,0 @@\n-${text(sha).split("\n")[0]}` });
+        return out;
+      };
+      const text = (sha) => (state.blobs.get(sha) ? state.blobs.get(sha).toString("utf8") : "");
+      const shape = (c) => ({
+        sha: c.sha,
+        commit: {
+          message: c.message,
+          author: { name: c.authorName || "Test User", email: "test@example.com", date: c.date || stamp(c) },
+        },
+        // Real GitHub sends author:null when the commit email is not linked to an account.
+        author: c.authorLogin === null ? null : { login: c.authorLogin || "testuser" },
+        parents: (c.parents || []).map((p) => ({ sha: p })),
+      });
+      // Synthetic but STRICTLY DECREASING with depth, so "newest first" is a real assertion.
+      const stamp = (c) => {
+        let depth = 0, cur = c.sha;
+        while (cur && state.commits.has(cur)) { depth++; cur = (state.commits.get(cur).parents || [])[0]; }
+        return new Date(Date.UTC(2026, 0, 1) + depth * 3600_000).toISOString();
+      };
+
+      if (rest.length === 2) {
+        // Scoped to commits reachable from THIS repo, so cross-repo isolation is testable.
+        const head = repo.refs.get(`heads/${repo.defaultBranch}`);
+        const reachable = head ? walk(head) : [];
+        const hits = reachable.filter((x) => x.sha === rest[1] || x.sha.startsWith(rest[1]));
+        // Real GitHub answers 422 for an unknown OR ambiguous sha, never 404.
+        if (hits.length !== 1) return json(res, 422, { message: `No commit found for SHA: ${rest[1]}` });
+        return json(res, 200, { ...shape(hits[0]), files: filesOf(hits[0]), stats: { total: filesOf(hits[0]).length } });
+      }
+      if (repo.empty) return json(res, 409, { message: "Git Repository is empty." });
+      const head = repo.refs.get(`heads/${url.searchParams.get("sha") || repo.defaultBranch}`);
+      if (!head) return notFound(res);
+      let list = walk(head);
+      const qPath = url.searchParams.get("path");
+      if (qPath) {
+        const pre = qPath.replace(/\/+$/, "");
+        list = list.filter((c) => filesOf(c).some((f) => f.filename === pre || f.filename.startsWith(pre + "/")));
+      }
+      return json(res, 200, list.slice(0, Math.min(100, Number(url.searchParams.get("per_page")) || 30)).map(shape));
+    }
+
     // 2. GET /repos/:o/:r/contents/:path...
     if (method === "GET" && rest[0] === "contents") {
       const path = rest.slice(1).join("/");

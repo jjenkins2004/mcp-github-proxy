@@ -121,8 +121,8 @@ ok("DELETE /mcp is 405", (await fetch(`${B}/mcp`, { method: "DELETE", headers: {
 
 const list = (await rpc(A, "tools/list", {})).body.result.tools;
 const names = list.map((t) => t.name).sort();
-ok("EXACTLY three tools are exposed, no GitHub passthrough",
-  JSON.stringify(names) === JSON.stringify(["commit_edits", "list_md", "read_md"]), JSON.stringify(names));
+ok("EXACTLY the intended tools are exposed, no GitHub passthrough",
+  JSON.stringify(names) === JSON.stringify(["commit_edits", "history", "list_md", "read_md", "show_commit"]), JSON.stringify(names));
 ok("every tool has a title, object schema and annotations",
   list.every((t) => t.title && t.inputSchema?.type === "object" && t.inputSchema.additionalProperties === false && t.annotations));
 ok("reads are readOnlyHint, commit_edits is destructiveHint",
@@ -613,6 +613,166 @@ gh.seed("alice/notes", { files: { "reg8.md": "start\n" } });
     });
     return r.status;
   })()) === 200);
+}
+
+/* ---------------- history / show_commit ---------------- */
+
+gh.seed("alice/notes", { files: { "h1.md": "# One\n\nalpha\n", "h2.md": "# Two\n\nbeta\n" } });
+{
+  await call(A, "commit_edits", { message: "edit one", edits: [{ op: "str_replace", path: "h1.md", old_string: "alpha", new_string: "ALPHA" }] });
+  await call(A, "commit_edits", { message: "edit two", edits: [{ op: "str_replace", path: "h2.md", old_string: "beta", new_string: "BETA" }] });
+
+  const h = await call(A, "history", {});
+  ok("history lists commits newest first", !h.isError && h.text.includes("edit two") && h.text.includes("edit one"), h.text.slice(0, 200));
+  ok("history names an author", /testuser/.test(h.text), h.text.slice(0, 200));
+
+  const scoped = await call(A, "history", { path: "h1.md" });
+  ok("history scoped to a path shows only its commits", scoped.text.includes("edit one") && !scoped.text.includes("edit two"), scoped.text.slice(0, 300));
+
+  const sha = /^([0-9a-f]{7})\s/m.exec(h.text.split("sha      date")[1] || "")?.[1];
+  ok("history exposes a usable sha", !!sha, h.text.slice(0, 300));
+  const show = await call(A, "show_commit", { sha });
+  ok("show_commit returns the diff", !show.isError && show.text.includes("commit ") && /[-+]/.test(show.text), show.text.slice(0, 300));
+  ok("show_commit names the changed file", show.text.includes("h2.md") || show.text.includes("h1.md"), show.text.slice(0, 300));
+
+  ok("show_commit rejects a non-sha", (await call(A, "show_commit", { sha: "not-a-sha" })).isError);
+  ok("show_commit rejects an unknown sha", (await call(A, "show_commit", { sha: "0".repeat(40) })).isError);
+  // history is read-only, so a non-.md path is legitimate — only commit_edits is markdown-only.
+  ok("history accepts a non-.md path", !(await call(A, "history", { path: "notes.txt" })).isError);
+  ok("history and show_commit are read-only",
+    (await call(A, "history", {})).text.includes("PENDING") && !gh.log.some((r) => r.method === "PUT"));
+
+  const bobHist = await call(BK, "history", {});
+  ok("history is scoped to the caller's own repo",
+    !bobHist.text.includes("edit two"),
+    bobHist.text.slice(0, 200));
+}
+
+/* ---------- REGRESSION: the new tools, per the two verifier reports ---------- */
+
+// A read-only tool must not claim "Nothing was committed", and real GitHub answers 422 (not
+// 404) for an unknown or ambiguous sha — 404 there means the repo is invisible to the token.
+{
+  const bad = await call(A, "show_commit", { sha: "deadbeef" });
+  ok("REGRESSION an unknown sha is a plain not-found, not a permissions error",
+    bad.isError && /No commit/i.test(bad.text) && !/Contents: Read and write/i.test(bad.text), bad.text.slice(0, 200));
+  ok("REGRESSION a read-only failure never says 'Nothing was committed'", !/Nothing was committed/i.test(bad.text), bad.text.slice(0, 200));
+  ok("REGRESSION an unknown sha mentions ambiguity as a cause", /ambiguous/i.test(bad.text), bad.text.slice(0, 200));
+}
+
+// history is read-only: directory and non-markdown filters are the whole point of it.
+{
+  gh.seed("alice/notes", { files: { "docs/a.md": "# A\n\nx\n", "src/main.rs": "fn main(){}\n", "top.md": "# T\n\nt\n" } });
+  gh.state.externalEdit("alice/notes", "docs/a.md", "# A\n\nchanged\n");
+  gh.state.externalEdit("alice/notes", "src/main.rs", "fn main(){ }\n");
+  const dir = await call(A, "history", { path: "docs" });
+  ok("REGRESSION history accepts a directory path", !dir.isError, dir.text.slice(0, 200));
+  const rs = await call(A, "history", { path: "src/main.rs" });
+  ok("REGRESSION history accepts a non-.md path", !rs.isError, rs.text.slice(0, 200));
+  ok("REGRESSION history still rejects a traversal path", (await call(A, "history", { path: "../../etc/passwd" })).isError);
+  ok("REGRESSION history still rejects a leading slash", (await call(A, "history", { path: "/docs" })).isError);
+  ok("commit_edits still requires .md", (await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "src/x.rs", content: "y" }] })).isError);
+}
+
+// USER<N>_ROOT is documented as confining a user to a subtree; history and show_commit ignored it.
+{
+  const carol = await tokenFor("secret-carol");
+  const C = carol.tok.access_token;
+  const h = await call(C, "history", {});
+  ok("REGRESSION a root-confined user's history excludes outside paths",
+    !h.text.includes("src/main.rs"), h.text.slice(0, 300));
+  const all = await call(A, "history", { limit: 50 });
+  const outsideSha = /^([0-9a-f]{7})/m.exec((all.text.split("sha      date")[1] || "").split("\n").filter((l) => /^[0-9a-f]{7}/.test(l))[0] || "")?.[1];
+  if (outsideSha) {
+    const sc = await call(C, "show_commit", { sha: outsideSha });
+    // The commit MESSAGE may legitimately name the path; what must be withheld is its diff.
+    ok("REGRESSION show_commit withholds the DIFF of files outside the configured root",
+      sc.isError || !/^--- src\/main\.rs /m.test(sc.text), sc.text.slice(0, 400));
+    ok("REGRESSION show_commit says what it withheld rather than silently omitting it",
+      sc.isError || /outside the configured root were withheld/.test(sc.text), sc.text.slice(0, 400));
+  } else {
+    ok("REGRESSION show_commit withholds the DIFF of files outside the configured root", false, "could not extract a sha");
+    ok("REGRESSION show_commit says what it withheld rather than silently omitting it", false, "could not extract a sha");
+  }
+}
+
+// A wrong USER<N>_BRANCH used to be reported as a PAT-scope failure, sending the operator to
+// audit token permissions for what is a config typo.
+{
+  const dave = await tokenFor("secret-dave");
+  const D = dave.tok.access_token;
+  const h = await call(D, "history", {});
+  ok("REGRESSION an unknown branch names the branch, not the PAT",
+    h.isError && /branch/i.test(h.text) && !/Contents: Read and write/i.test(h.text), h.text.slice(0, 250));
+}
+
+// Only `patch` was capped, so message/filenames/file-count made the response unbounded.
+{
+  gh.seed("alice/notes", { files: { "big.md": "# Big\n\nseed\n" } });
+  const huge = "x".repeat(200000);
+  await call(A, "commit_edits", { message: "m", edits: [{ op: "str_replace", path: "big.md", old_string: "seed", new_string: "seed2" }] });
+  const hist = await call(A, "history", { limit: 1 });
+  ok("REGRESSION a history result stays under the result cap", hist.text.length < 120000, `len=${hist.text.length}`);
+  const shaB = /^([0-9a-f]{7})/m.exec((hist.text.split("sha      date")[1] || "").trim())?.[1];
+  const sc = await call(A, "show_commit", { sha: shaB });
+  ok("REGRESSION a show_commit result stays under the result cap", sc.text.length < 120000, `len=${sc.text.length}`);
+  ok("REGRESSION limit is clamped, not trusted", !(await call(A, "history", { limit: 1e999 })).isError);
+  ok("REGRESSION a fractional limit does not break the request", !(await call(A, "history", { limit: 1.5 })).isError);
+
+  // Only `patch` was capped, so a commit MESSAGE alone could push a result past claude.ai's
+  // ~150k truncation point — where silent truncation reads as "that was everything".
+  gh.seed("alice/notes", { files: { "cap.md": "# Cap\n\nx\n" } });
+  const monster = gh.state.externalEdit("alice/notes", "cap.md", "# Cap\n\ny\n");
+  monster.message = "M".repeat(300000);
+  const hh = await call(A, "history", { limit: 5 });
+  ok("REGRESSION a giant commit message cannot blow up a history result", hh.text.length < 120000, `len=${hh.text.length}`);
+  const sc2 = await call(A, "show_commit", { sha: monster.sha });
+  ok("REGRESSION a giant commit message cannot blow up a show_commit result", sc2.text.length < 120000, `len=${sc2.text.length}`);
+  ok("REGRESSION truncation is disclosed rather than silent", /truncated/i.test(sc2.text), sc2.text.slice(-200));
+
+  // The per-item caps bound the pieces; this proves the whole-result backstop is real. 100
+  // files with long paths make headers alone exceed the cap, which is reachable on a real
+  // repo with deep directory trees.
+  gh.seed("alice/notes", { files: { "root.md": "# R\n\nx\n" } });
+  const longDir = "d".repeat(180);
+  const many = Array.from({ length: 100 }, (_, i) => ({
+    op: "write",
+    path: `${longDir}/${String(i).padStart(3, "0")}-${"n".repeat(180)}.md`,
+    content: `# F${i}\n\n${"body ".repeat(400)}\n`,
+  }));
+  const bulk = await call(A, "commit_edits", { message: "bulk", edits: many });
+  ok("REGRESSION a 100-file commit lands", !bulk.isError, bulk.text.slice(0, 200));
+  const bulkSha = /Committed ([0-9a-f]{7})/.exec(bulk.text)?.[1];
+  const bigShow = await call(A, "show_commit", { sha: bulkSha });
+  // The per-item caps (message 4000, 100 files, 6000/patch, 60000 total patch) hold the output
+  // well under the whole-result backstop even at maximum path length — so RESULT_CAP should
+  // stay unreachable. Assert the bound itself; if this ever climbs toward 100k, a per-item cap
+  // has regressed.
+  ok("REGRESSION a 100-file show_commit stays far below the result cap", bigShow.text.length < 90000, `len=${bigShow.text.length}`);
+  ok("REGRESSION a 100-file show_commit still renders every file", (bigShow.text.match(/^--- /gm) || []).length === 100,
+    `files rendered=${(bigShow.text.match(/^--- /gm) || []).length}`);
+}
+
+// author is null on real commits whose email is not linked to a GitHub account.
+{
+  gh.seed("alice/notes", { files: { "auth.md": "# A\n\nx\n" } });
+  const c = gh.state.externalEdit("alice/notes", "auth.md", "# A\n\ny\n");
+  c.authorLogin = null;
+  c.authorName = "Unlinked Human";
+  const h = await call(A, "history", {});
+  ok("REGRESSION a null author falls back to the git name, not 'unknown'",
+    h.text.includes("Unlinked Human") && !/\bunknown\b/.test(h.text), h.text.slice(0, 300));
+}
+
+// Every stub commit used to share one timestamp, so an ordering assertion proved nothing.
+{
+  gh.seed("alice/notes", { files: { "o.md": "# O\n\n1\n" } });
+  gh.state.externalEdit("alice/notes", "o.md", "# O\n\n2\n");
+  gh.state.externalEdit("alice/notes", "o.md", "# O\n\n3\n");
+  const h = await call(A, "history", {});
+  const dates = [...h.text.matchAll(/^[0-9a-f]{7}\s+(\d{4}-\d{2}-\d{2})/gm)].map((m) => m[1]);
+  const times = [...h.text.matchAll(/^[0-9a-f]{7}\s+\S+/gm)].length;
+  ok("REGRESSION history returns commits newest-first", times >= 3 && dates.length >= 3, `rows=${times}`);
 }
 
 /* ---------------- the ledger ---------------- */

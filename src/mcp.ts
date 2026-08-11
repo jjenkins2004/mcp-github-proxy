@@ -2,7 +2,7 @@
    No GitHub tool is proxied. This server terminates MCP itself. */
 
 import { randomBytes } from "node:crypto";
-import { Edit, ToolError, User, commitEdits, listMd, readMd, validatePath } from "./github.js";
+import { Edit, ToolError, User, commitEdits, history, listMd, readMd, showCommit, validatePath, validateReadPath } from "./github.js";
 import { EditError } from "./md.js";
 
 const KNOWN_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
@@ -140,6 +140,41 @@ export const TOOLS = [
     annotations: { title: "Read markdown file", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
+    name: "history",
+    title: "Commit history",
+    description:
+      "List recent commits, newest first, with who authored each one and when. Pass a path to get only the commits that touched " +
+      "that file. Read-only. Authors are real GitHub accounts, so this answers who changed what. Use show_commit with a sha from " +
+      "here to see the actual diff.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            'Optional repo-relative path — a file ("docs/guide.md") or a directory ("docs"). Omit for the whole repository. ' +
+            "Does not follow renames: commits from before a rename are listed under the old path.",
+        },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "How many commits to return. Default 20." },
+      },
+      additionalProperties: false,
+    },
+    annotations: { title: "Commit history", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "show_commit",
+    title: "Show a commit diff",
+    description:
+      "Show one commit: its author, date, full message, and the diff of every file it changed. Read-only. Take the sha from history().",
+    inputSchema: {
+      type: "object",
+      properties: { sha: { type: "string", description: "The commit SHA, full or abbreviated (at least 7 hex characters)." } },
+      required: ["sha"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Show a commit diff", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
     name: "commit_edits",
     title: "Commit markdown edits",
     description:
@@ -176,6 +211,15 @@ const INSTRUCTIONS =
 
 const text = (s: string) => ({ content: [{ type: "text", text: s }] });
 const toolError = (s: string) => ({ content: [{ type: "text", text: s }], isError: true });
+
+const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+/** claude.ai silently truncates a tool result around 150k characters. Silent truncation reads
+    as "that was everything", so cap below it and say so. Per-item caps bound the pieces; this
+    bounds the whole, including headers and notes. */
+const RESULT_CAP = 100_000;
+const capResult = (s: string) =>
+  s.length <= RESULT_CAP ? s : s.slice(0, RESULT_CAP) + `\n\n… output truncated at ${RESULT_CAP} characters; narrow the request (fewer commits, or a path filter).`;
 
 function str(v: unknown, field: string): string {
   if (typeof v !== "string") throw new ToolError(`${field} must be a string.`);
@@ -280,6 +324,49 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
     out += `\n\n--- content (from line ${r.startLine}) ---\n${r.content}`;
     if (r.clipped) out += `\n--- truncated at max_bytes; continue with offset_lines ---`;
     return text(out + ledger(user.id));
+  }
+
+  if (name === "history") {
+    // Deliberately NOT validatePath: history is read-only, and directory or non-markdown
+    // filters are exactly what "who changed what" questions are made of.
+    const path = args.path === undefined ? undefined : validateReadPath(user, args.path);
+    const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.min(100, Math.max(1, Math.floor(args.limit))) : 20;
+    const r = await history(user, path, limit);
+    if (!r.commits.length) return text(`No commits${path ? ` touching ${path}` : ""} on ${r.branch}.${ledger(user.id)}`);
+    const rows = r.commits
+      .map((c) => `${c.sha.slice(0, 7)}  ${(c.date || "").slice(0, 10)}  ${clip(c.author, 20).padEnd(20)}  ${clip(c.message, 100)}`)
+      .join("\n");
+    let out =
+      `${user.repo} on ${r.branch}${path ? ` — commits touching ${path}` : ""} (${r.commits.length}, newest first)\n\n` +
+      `sha      date        author                message\n${rows}\n\n` +
+      `Use show_commit with a sha to see the diff.`;
+    if (path) out += `\nNote: this follows the path as it is named now; commits from before a rename are listed under the old path.`;
+    return text(capResult(out) + ledger(user.id));
+  }
+
+  if (name === "show_commit") {
+    const c = await showCommit(user, str(args.sha, "sha"));
+    let out = `commit ${c.sha}\nauthor: ${c.author}${c.email ? ` <${c.email}>` : ""}\ndate:   ${c.date}\n\n${c.message}`;
+    if (c.messageClipped) out += `\n… message truncated`;
+    out += "\n";
+    if (!c.files.length) out += `\n(no file changes visible in this commit)`;
+    for (const f of c.files) {
+      const renamed = f.previousFilename ? ` from ${f.previousFilename}` : "";
+      out += `\n--- ${f.filename} (${f.status}${renamed}, +${f.additions} -${f.deletions}) ---\n`;
+      // "no textual diff" and "truncated" are different facts and must not both be claimed.
+      if (f.patch) out += f.patch;
+      else if (f.clipped) out += "(diff omitted — this commit's total diff budget was spent)";
+      else if (f.noDiff) out += "(no textual diff: binary file, a pure rename, or too large for GitHub to diff)";
+      else out += "(empty diff)";
+      if (f.clipped && f.patch) out += `\n… diff truncated; read_md("${f.filename}") for the current full text`;
+      out += "\n";
+    }
+    const notes: string[] = [];
+    if (c.filesShown < c.filesTotal) notes.push(`showing ${c.filesShown} of ${c.filesTotal} changed files`);
+    if (c.pagedByGitHub) notes.push(`GitHub returned only the first ${c.files.length ? 300 : 0} files of this commit${c.totalChanges ? ` (${c.totalChanges} total line changes)` : ""}`);
+    if (c.withheldByRoot) notes.push(`${c.withheldByRoot} file(s) outside the configured root were withheld`);
+    if (notes.length) out += `\n${notes.map((n) => `note: ${n}`).join("\n")}`;
+    return text(capResult(out) + ledger(user.id));
   }
 
   if (name === "commit_edits") {
