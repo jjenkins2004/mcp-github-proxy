@@ -67,6 +67,9 @@ function verify(token: string): Record<string, any> | null {
     const claims = JSON.parse(Buffer.from(body, "base64url").toString());
     if (typeof claims.exp !== "number" || claims.exp * 1000 < Date.now()) return null;
     if (claims.iss !== PUBLIC_URL) return null;
+    // Audience is mandatory for MCP (RFC 8707): without it a token minted for another resource
+    // that happens to share JWT_SECRET would be accepted here. Refresh tokens carry no aud.
+    if (claims.typ === "access" && claims.aud !== `${PUBLIC_URL}/mcp`) return null;
     return claims;
   } catch {
     return null;
@@ -265,7 +268,9 @@ const server = createServer(async (rq, res) => {
     /* --- MCP endpoint. This server terminates MCP; nothing is proxied. --- */
     if (path === "/mcp") {
       const auth = rq.headers.authorization || "";
-      const claims = auth.startsWith("Bearer ") ? verify(auth.slice(7)) : null;
+      // RFC 7235: the auth scheme is case-insensitive.
+      const bearer = /^bearer\s+(.+)$/i.exec(auth);
+      const claims = bearer ? verify(bearer[1]!.trim()) : null;
       const caller = claims?.typ === "access" ? users.find((u) => u.id === claims.sub) : undefined;
       if (!caller) {
         // Only ever this server's own JWT and its own resource metadata. A GitHub 401
@@ -286,8 +291,13 @@ const server = createServer(async (rq, res) => {
       }
 
       if (Array.isArray(msg)) {
+        if (!msg.length) return json(res, 200, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: empty batch" } });
         const out = (await Promise.all(msg.map((m) => handleMessage(caller, m)))).filter(Boolean);
-        if (!out.length) return json(res, 202, "");
+        if (!out.length) {
+          // A notification-only batch gets 202 with a genuinely empty body, not the JSON string "".
+          res.writeHead(202, CORS);
+          return res.end();
+        }
         return json(res, 200, out);
       }
 

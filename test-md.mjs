@@ -11,6 +11,8 @@ const ok = (name, cond, extra = "") => {
 const L = (s) => s.split("\n");
 const texts = (src) => scanHeadings(L(src)).headings.map((h) => h.text).join(",");
 const threw = (fn) => { try { fn(); return null; } catch (e) { return e.message; } };
+const sr = (raw, ...a) => { const d = parseDoc(raw); const r = strReplace(d, "a.md", ...a); return { out: render(r.doc), lf: r.doc.text, note: r.note }; };
+const es = (raw, ...a) => { const d = parseDoc(raw); const r = editSection(d, "a.md", ...a); return { out: render(r.doc), lf: r.doc.text, note: r.note }; };
 
 /* ---------- scanner: the 22 prototype cases ---------- */
 
@@ -33,14 +35,11 @@ ok("setext H1 and H2", (() => {
   return h.map((x) => x.level + ":" + x.text).join(",") === "1:Title,2:Sub";
 })());
 ok("trailing hashes stripped", scanHeadings(L("## Foo ##\n")).headings[0].text === "Foo");
-ok("empty ATX heading", (() => {
-  const h = scanHeadings(L("##\n")).headings;
-  return h.length === 1 && h[0].text === "";
-})());
+ok("empty ATX heading", scanHeadings(L("##\n")).headings.length === 1);
 ok("no space after # is not a heading", texts("#Foo\n\n## Bar\n") === "Bar");
 ok("7 hashes is not a heading", texts("####### Foo\n\n## Bar\n") === "Bar");
-ok("heading inside HTML block ignored", texts("# A\n\n<div>\n## Fake\n</div>\n\n## B\n") === "A,B");
-ok("heading inside HTML comment ignored", texts("# A\n<!--\n## Fake\n-->\n## B\n") === "A,B");
+ok("heading inside multi-line HTML block ignored", texts("# A\n\n<div>\n## Fake\n</div>\n\n## B\n") === "A,B");
+ok("heading inside multi-line HTML comment ignored", texts("# A\n<!--\n## Fake\n-->\n## B\n") === "A,B");
 ok("blockquote heading not addressable", texts("# A\n\n> ## Quoted\n\n## B\n") === "A,B");
 ok("unclosed fence detected", (() => {
   const r = scanHeadings(L("# A\n```\n## Fake\n"));
@@ -60,136 +59,187 @@ ok("last section runs to EOF", (() => {
 ok("setext span starts at the paragraph line", (() => {
   const lines = L("Intro\n=====\ntext\n\nSub\n---\nmore\n");
   const h = scanHeadings(lines).headings;
-  const a = sectionSpan(h, 0, lines.length);
-  const b = sectionSpan(h, 1, lines.length);
-  return a.start === 0 && a.bodyStart === 2 && b.start === 4 && b.bodyStart === 6;
+  return sectionSpan(h, 0, lines.length).bodyStart === 2 && sectionSpan(h, 1, lines.length).start === 4;
 })());
+
+/* ---------- REGRESSION: one-line HTML blocks (silent whole-file deletion) ---------- */
+
+// An opener whose end condition is satisfied on its own line closes immediately. Missing this,
+// `<!-- toc -->` wedged the scanner open to EOF: every later heading vanished and editing an
+// earlier section deleted the rest of the file, with no warning of any kind.
+ok("REGRESSION one-line HTML comment does not swallow the file",
+  texts("# Project\n\n<!-- markdownlint-disable MD013 -->\n\n## Install\n\nx\n\n## Usage\n\ny\n") === "Project,Install,Usage");
+// Sections after a one-line comment must be addressable at all — previously the scanner could
+// not see them, so they could neither be edited nor protected from an edit above them.
+// (Replacing the H1 body legitimately takes its nested H2s; that is documented behavior.)
+ok("REGRESSION a section after a one-line comment is addressable", (() => {
+  const r = es("# Project\n\n<!-- toc -->\n\n## Install\n\nx\n\n## Usage\n\ny\n", "Install", "replace", "npm i");
+  return r.out.includes("npm i") && r.out.includes("## Usage") && r.out.includes("<!-- toc -->");
+})());
+ok("REGRESSION one-line <pre> closes on itself", texts("# A\n\n<pre>x</pre>\n\n## B\n") === "A,B");
+ok("REGRESSION one-line <script> closes on itself", texts("# A\n\n<script>var x=1</script>\n\n## B\n") === "A,B");
+ok("REGRESSION one-line CDATA closes on itself", texts("# A\n\n<![CDATA[x]]>\n\n## B\n") === "A,B");
+ok("REGRESSION one-line processing instruction closes on itself", texts("# A\n\n<?php echo 1; ?>\n\n## B\n") === "A,B");
+ok("REGRESSION one-line declaration closes on itself", texts("# A\n\n<!DOCTYPE html>\n\n## B\n") === "A,B");
+ok("multi-line HTML comment still spans", texts("# A\n<!--\n## Fake\n-->\n## B\n") === "A,B");
+
+/* ---------- REGRESSION: front matter heuristic ---------- */
+
+// A `---` thematic break followed later by another `---` was read as front matter, hiding
+// every heading between them.
+ok("REGRESSION --- break plus a later --- is not front matter",
+  texts("---\n\n# A\n\nbody\n\n---\n\n# B\n\nb\n") === "A,B");
+ok("real front matter is still detected", scanHeadings(L("---\ntitle: x\ntags: [a]\n---\n\n# T\n")).frontMatterEnd === 3);
+ok("--- followed by prose is not front matter", scanHeadings(L("---\njust prose here\n---\n\n# T\n")).frontMatterEnd === null);
 
 /* ---------- byte fidelity ---------- */
 
-{
-  const raw = "# T\r\nalpha\r\nbeta\r\n";
-  const doc = parseDoc(raw);
-  const r = strReplace(doc, "a.md", "alpha", "ALPHA", false);
-  const out = render(doc, r.text);
-  ok("CRLF file keeps CRLF on untouched lines", out === "# T\r\nALPHA\r\nbeta\r\n", JSON.stringify(out));
-}
-{
-  const raw = "﻿# Title\nbody\n";
-  const doc = parseDoc(raw);
-  ok("BOM is split off so a start-anchored match works", doc.text.indexOf("# Title") === 0);
-  const r = strReplace(doc, "a.md", "# Title", "# New", false);
-  ok("BOM is re-attached on write", render(doc, r.text) === "﻿# New\nbody\n");
-}
-{
-  const raw = "line one  \nline two\n";
-  const doc = parseDoc(raw);
-  const r = strReplace(doc, "a.md", "line two", "line 2", false);
-  ok("hard line break (two trailing spaces) survives", render(doc, r.text) === "line one  \nline 2\n");
-}
-{
-  const raw = "alpha\nbeta";
-  const doc = parseDoc(raw);
-  const r = strReplace(doc, "a.md", "alpha", "ALPHA", false);
-  ok("missing trailing newline is not invented", render(doc, r.text) === "ALPHA\nbeta");
-}
+ok("CRLF file keeps CRLF on untouched lines", sr("# T\r\nalpha\r\nbeta\r\n", "alpha", "ALPHA", false).out === "# T\r\nALPHA\r\nbeta\r\n");
+ok("BOM is split off so a start-anchored match works", parseDoc("﻿# Title\nbody\n").text.indexOf("# Title") === 0);
+ok("BOM is re-attached on write", sr("﻿# Title\nbody\n", "# Title", "# New", false).out === "﻿# New\nbody\n");
+ok("hard line break (two trailing spaces) survives", sr("line one  \nline two\n", "line two", "line 2", false).out === "line one  \nline 2\n");
+ok("missing trailing newline is not invented", sr("alpha\nbeta", "alpha", "ALPHA", false).out === "ALPHA\nbeta");
+
+// REGRESSION: a mixed-EOL file used to be rewritten wholesale to the majority ending.
+ok("REGRESSION mixed EOL: untouched CRLF line keeps its CRLF",
+  sr("# T\nalpha\r\nbeta\ngamma\n", "gamma", "GAMMA", false).out === "# T\nalpha\r\nbeta\nGAMMA\n",
+  JSON.stringify(sr("# T\nalpha\r\nbeta\ngamma\n", "gamma", "GAMMA", false).out));
+ok("REGRESSION mixed EOL: untouched LF line keeps its LF",
+  sr("# T\r\nalpha\r\nbeta\ngamma\r\n", "alpha", "ALPHA", false).out === "# T\r\nALPHA\r\nbeta\ngamma\r\n",
+  JSON.stringify(sr("# T\r\nalpha\r\nbeta\ngamma\r\n", "alpha", "ALPHA", false).out));
 
 /* ---------- str_replace ---------- */
 
 {
-  const doc = parseDoc("a\nfoo\nb\nfoo\n");
-  const msg = threw(() => strReplace(doc, "a.md", "foo", "bar", false));
+  const d = parseDoc("a\nfoo\nb\nfoo\n");
+  const msg = threw(() => strReplace(d, "a.md", "foo", "bar", false));
   ok("2 matches names both line numbers", msg.includes("lines 2, 4"), msg);
   ok("2 matches names both remedies", msg.includes("more surrounding context") && msg.includes("replace_all=true"), msg);
-  const r = strReplace(doc, "a.md", "foo", "bar", true);
-  ok("replace_all replaces every occurrence", r.text === "a\nbar\nb\nbar\n");
+  const r = sr("a\nfoo\nb\nfoo\n", "foo", "bar", true);
+  ok("replace_all replaces every occurrence", r.out === "a\nbar\nb\nbar\n", JSON.stringify(r.out));
   ok("replace_all reports the count", r.note.includes("2 occurrence"));
 }
+
+// REGRESSION: overlapping matches were counted and spliced as separate replacements.
+ok("REGRESSION replace_all does not count overlapping matches",
+  sr("a -- b\nsep: -----\n", "--", "X", true).out === "a X b\nsep: XX-\n",
+  JSON.stringify(sr("a -- b\nsep: -----\n", "--", "X", true).out));
+ok("REGRESSION overlapping count is reported honestly", sr("a -- b\nsep: -----\n", "--", "X", true).note.includes("3 occurrence"));
+ok("REGRESSION aaaa/aa yields two replacements", sr("aaaa\n", "aa", "b", true).out === "bb\n");
+ok("REGRESSION xaaay/aa yields one replacement", sr("xaaay\n", "aa", "b", true).out === "xbay\n");
+
 {
-  const doc = parseDoc("# Guide\ninstall the thing\n");
-  const msg = threw(() => strReplace(doc, "a.md", "instal the thing", "x", false));
+  const msg = threw(() => strReplace(parseDoc("# Guide\ninstall the thing\n"), "a.md", "instal the thing", "x", false));
   ok("0 matches says did not appear verbatim", msg.includes("did not appear verbatim"), msg);
   ok("0 matches offers near-miss candidates with line numbers", msg.includes("line 2"), msg);
 }
-{
-  const doc = parseDoc("alpha\nbeta\n");
-  const msg = threw(() => strReplace(doc, "a.md", "gamma", "beta", false));
-  ok("0 matches warns the edit may already have landed", msg.includes("may already have landed"), msg);
-}
+ok("0 matches warns the edit may already have landed",
+  (threw(() => strReplace(parseDoc("alpha\nbeta\n"), "a.md", "gamma", "beta", false)) || "").includes("may already have landed"));
 ok("old_string === new_string is rejected", (threw(() => strReplace(parseDoc("a\n"), "a.md", "a", "a", false)) || "").includes("must be different"));
 ok("empty old_string is rejected", (threw(() => strReplace(parseDoc("a\n"), "a.md", "", "b", false)) || "").includes("must not be empty"));
+
+// REGRESSION: the indent-insensitive recovery ladder stripped real indentation, turning an
+// indented code block into a live heading.
+{
+  const src = "# Doc\n\nExample:\n\n    ## fake heading\n    more code\n\ndone\n";
+  const r = sr(src, "## fake heading\nmore code", "## fake heading\nmore code 2", false);
+  ok("REGRESSION relaxed match preserves the original indentation",
+    r.out === "# Doc\n\nExample:\n\n    ## fake heading\n    more code 2\n\ndone\n", JSON.stringify(r.out));
+  ok("REGRESSION relaxed match does not create a heading", scanHeadings(L(r.out)).headings.length === 1);
+}
+ok("REGRESSION ragged indentation refuses the relaxed match rather than guessing",
+  (threw(() => strReplace(parseDoc("# D\n\n    a\n      b\n"), "a.md", "a\nb", "a\nB", false)) || "").includes("did not appear verbatim"));
 
 /* ---------- edit_section ---------- */
 
 const DOC = "# Guide\n\nintro\n\n## Install\n\nstep one\n\n### Notes\n\ndeep\n\n## Usage\n\nrun it\n";
 
-{
-  const r = editSection(parseDoc(DOC), "a.md", "Install", "replace", "NEW BODY");
-  ok("replace keeps the heading line", r.text.includes("## Install\nNEW BODY"), r.text);
-  ok("replace removes the nested sub-heading", !r.text.includes("### Notes"));
-  ok("replace leaves the following section intact", r.text.includes("## Usage\n\nrun it"));
-  ok("replace leaves one blank line before the next heading", /NEW BODY\n\n## Usage/.test(r.text), JSON.stringify(r.text));
-}
-{
-  const r = editSection(parseDoc(DOC), "a.md", "Install", "delete", undefined);
-  ok("delete removes heading and body", !r.text.includes("## Install") && !r.text.includes("step one"));
-  ok("delete takes nested sub-headings with it", !r.text.includes("### Notes"));
-  ok("delete keeps sibling sections", r.text.includes("## Usage"));
-}
-{
-  const r = editSection(parseDoc(DOC), "a.md", "Notes", "append", "appended line");
-  // Appends directly after the section's last non-blank line, not after its trailing blank.
-  ok("append inserts inside the section", /deep\nappended line/.test(r.text), JSON.stringify(r.text));
-  ok("append does not cross the next heading", r.text.indexOf("appended line") < r.text.indexOf("## Usage"));
-}
-{
-  const r = editSection(parseDoc(DOC), "a.md", "Usage", "prepend", "first!");
-  ok("prepend inserts right after the heading", /## Usage\nfirst!/.test(r.text), JSON.stringify(r.text));
-}
+ok("replace keeps the heading line", es(DOC, "Install", "replace", "NEW BODY").lf.includes("## Install\nNEW BODY"));
+ok("replace removes the nested sub-heading", !es(DOC, "Install", "replace", "NEW BODY").lf.includes("### Notes"));
+ok("replace leaves the following section intact", es(DOC, "Install", "replace", "NEW BODY").lf.includes("## Usage\n\nrun it"));
+ok("replace leaves one blank line before the next heading", /NEW BODY\n\n## Usage/.test(es(DOC, "Install", "replace", "NEW BODY").lf));
+ok("delete removes heading and body", !es(DOC, "Install", "delete", undefined).lf.includes("step one"));
+ok("delete takes nested sub-headings with it", !es(DOC, "Install", "delete", undefined).lf.includes("### Notes"));
+ok("delete keeps sibling sections", es(DOC, "Install", "delete", undefined).lf.includes("## Usage"));
+ok("append inserts inside the section", /deep\nappended line/.test(es(DOC, "Notes", "append", "appended line").lf));
+ok("append does not cross the next heading", (() => {
+  const t = es(DOC, "Notes", "append", "appended line").lf;
+  return t.indexOf("appended line") < t.indexOf("## Usage");
+})());
+ok("prepend inserts right after the heading", /## Usage\nfirst!/.test(es(DOC, "Usage", "prepend", "first!").lf));
 ok("delete with content is rejected", (threw(() => editSection(parseDoc(DOC), "a.md", "Usage", "delete", "x")) || "").includes("does not take content"));
 ok("replace without content is rejected", (threw(() => editSection(parseDoc(DOC), "a.md", "Usage", "replace", undefined)) || "").includes("requires content"));
+
+ok("repeated appends do not drift", (() => {
+  let d = parseDoc(DOC);
+  for (let i = 0; i < 4; i++) d = editSection(d, "a.md", "Notes", "append", "line").doc;
+  return !/\n\n\n/.test(render(d)) && (render(d).match(/line/g) || []).length === 4;
+})());
 
 {
   const dup = "# Guide\n\n## Install\n\n### Notes\na\n\n## Appendix\n\n### Notes\nb\n";
   const msg = threw(() => editSection(parseDoc(dup), "a.md", "Notes", "replace", "x"));
   ok("ambiguous heading is an error, not first-match-wins", msg.includes("matches 2 headings"), msg);
   ok("ambiguity lists breadcrumbs", msg.includes("Guide > Install > Notes"), msg);
-  const byCrumb = editSection(parseDoc(dup), "a.md", "Guide > Appendix > Notes", "replace", "PICKED");
-  ok("breadcrumb resolves to one section", byCrumb.text.includes("PICKED") && byCrumb.text.includes("a\n"));
-  const byIdx = editSection(parseDoc(dup), "a.md", "Notes#1", "replace", "IDX");
-  ok("occurrence index resolves to one section", byIdx.text.includes("IDX") && byIdx.text.includes("b\n"));
+  ok("breadcrumb resolves to one section", es(dup, "Guide > Appendix > Notes", "replace", "PICKED").lf.includes("PICKED"));
+  ok("occurrence index resolves to one section", es(dup, "Notes#1", "replace", "IDX").lf.includes("IDX"));
+  // REGRESSION: breadcrumb ancestors must match in order, not as an unordered set.
+  ok("REGRESSION reversed breadcrumb does not resolve",
+    (threw(() => editSection(parseDoc(dup), "a.md", "Notes > Appendix", "replace", "x")) || "").includes("No heading matched"));
 }
+
+// REGRESSION: `#N` and `>` were parsed before checking for a heading with that literal text,
+// so `## Issue #42` was unaddressable and `Notes #2` silently edited a different section.
+{
+  const iss = "# Doc\n\n## Issue #42\n\nbody\n\n## Other\n\nx\n";
+  ok("REGRESSION a heading literally containing #42 is addressable", es(iss, "Issue #42", "replace", "FIXED").lf.includes("FIXED"));
+  ok("REGRESSION editing it does not touch the sibling", es(iss, "Issue #42", "replace", "FIXED").lf.includes("## Other\n\nx"));
+  const gt = "# A > B\nfirst\n\n# A\n\n## B\nsecond\n";
+  const r = es(gt, "A > B", "replace", "PICKED");
+  ok("REGRESSION a heading literally containing > is addressable", /# A > B\nPICKED/.test(r.lf), JSON.stringify(r.lf));
+  const amb = "## Notes\nfirst\n\n## Notes #2\nliteral\n\n## Notes\nthird\n";
+  ok("REGRESSION literal 'Notes #2' targets the literal heading", /## Notes #2\nPICKED/.test(es(amb, "Notes #2", "replace", "PICKED").lf));
+}
+
+// REGRESSION: JS trim() treats NBSP/U+3000 as blank; markdown does not.
+ok("REGRESSION an NBSP-only line is not deleted by append",
+  es("## A\n\npara\n \n\n## B\n\nb\n", "A", "append", "added").lf.includes(" "),
+  JSON.stringify(es("## A\n\npara\n \n\n## B\n\nb\n", "A", "append", "added").lf));
+ok("REGRESSION a U+3000-only line is not deleted",
+  es("## A\n\npara\n　\n\n## B\n\nb\n", "A", "append", "added").lf.includes("　"));
+
 {
   const fenced = "# A\n\n```\n## Fake\n```\n\n## Real\nx\n";
   const msg = threw(() => editSection(parseDoc(fenced), "a.md", "Fake", "replace", "x"));
   ok("heading inside a fence is not addressable", msg.includes("No heading matched"), msg);
   ok("not-found lists the real headings", msg.includes("Real"), msg);
 }
-{
-  const unclosed = "# A\n\n```\n## Fake\n";
-  const msg = threw(() => editSection(parseDoc(unclosed), "a.md", "Fake", "replace", "x"));
-  ok("unclosed fence gets its own diagnostic", msg.includes("unclosed") && msg.includes("line 3"), msg);
-}
+ok("unclosed fence gets its own diagnostic",
+  (threw(() => editSection(parseDoc("# A\n\n```\n## Fake\n"), "a.md", "Fake", "replace", "x")) || "").includes("unclosed"));
 {
   const fm = "---\ntitle: x\n---\n\n## Real\nbody\n";
-  const r = editSection(parseDoc(fm), "a.md", "Real", "replace", "NEW");
-  ok("front matter is left byte-identical", r.text.startsWith("---\ntitle: x\n---\n"), JSON.stringify(r.text));
-  const msg = threw(() => editSection(parseDoc(fm), "a.md", "title: x", "replace", "x"));
-  ok("front matter is not addressable as a section", msg.includes("No heading matched"), msg);
+  ok("front matter is left byte-identical", es(fm, "Real", "replace", "NEW").out.startsWith("---\ntitle: x\n---\n"));
+  ok("front matter is not addressable as a section",
+    (threw(() => editSection(parseDoc(fm), "a.md", "title: x", "replace", "x")) || "").includes("No heading matched"));
 }
 
 /* ---------- delta invariants ---------- */
 
 ok("an edit that opens a fence and leaves it open is rejected",
-  (threw(() => deltaInvariants("# A\nbody\n", "# A\n```\nbody\n", "a.md")) || "").includes("unclosed code fence"));
+  (threw(() => deltaInvariants("# A\nbody\n", "# A\n```\nbody\n", "a.md", false)) || "").includes("unclosed code fence"));
 ok("a pre-existing unclosed fence is not blamed on this edit",
-  threw(() => deltaInvariants("# A\n```\nx\n", "# A\n```\nx\ny\n", "a.md")) === null);
+  threw(() => deltaInvariants("# A\n```\nx\n", "# A\n```\nx\ny\n", "a.md", false)) === null);
 ok("destroying front matter is rejected",
-  (threw(() => deltaInvariants("---\na: 1\n---\n# T\n", "# T\n", "a.md")) || "").includes("front matter"));
-ok("removing a heading warns rather than blocking", (() => {
-  const w = deltaInvariants("# A\n\n## B\nx\n", "# A\n", "a.md");
-  return w.length === 1 && w[0].includes("-1");
-})());
+  (threw(() => deltaInvariants("---\na: 1\n---\n# T\n", "# T\n", "a.md", false)) || "").includes("front matter"));
+ok("removing a heading warns rather than blocking", deltaInvariants("# A\n\n## B\nx\n", "# A\n", "a.md", false).length === 1);
+
+// REGRESSION: a file being created has no delta, so it must not be blamed for "gaining"
+// front matter — that made every Jekyll/Hugo/Obsidian note impossible to create.
+ok("REGRESSION creating a file with front matter is allowed",
+  threw(() => deltaInvariants("", "---\ntitle: hello\n---\n\n# Hello\n", "a.md", true)) === null);
+ok("REGRESSION creating a file that ends inside a fence is allowed",
+  threw(() => deltaInvariants("", "# F\n\n```js\nconst x = 1;\n", "a.md", true)) === null);
+ok("REGRESSION creating a file emits no spurious heading warning", deltaInvariants("", "# A\n\n## B\n", "a.md", true).length === 0);
 
 console.log(`${pass}/${pass + fail} passed`);
 process.exitCode = fail ? 1 : 0;

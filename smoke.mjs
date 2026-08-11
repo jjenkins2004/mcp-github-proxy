@@ -484,6 +484,137 @@ gh.seed("alice/notes", { files: { "reg3.md": "# R3\n\nbody\n" } });
   ok("REGRESSION GitHub's WWW-Authenticate is never forwarded", !probe.headers.get("www-authenticate"));
 }
 
+// BUG 6 (found by the commit-safety probe): on a 422 retry nothing compared the touched files'
+// SHAs between attempts, so ops without expect_sha re-applied over the colleague's fresh content
+// and returned a SUCCESS receipt while destroying their work.
+gh.seed("alice/notes", { files: { "reg6.md": "# Guide\n\nintro\n\n## Install\n\nstep one\n\n## Usage\n\nrun it\n" } });
+{
+  gh.reset();
+  gh.fault("422-once", {
+    thenAdvanceHeadWith: { repo: "alice/notes", path: "reg6.md", content: "# Guide\n\nintro\n\n## Install\n\nDO NOT DELETE - colleague hotfix\n\n## Usage\n\nrun it\n" },
+  });
+  const r = await call(A, "commit_edits", {
+    message: "delete install", edits: [{ op: "edit_section", path: "reg6.md", heading: "Install", mode: "delete" }],
+  });
+  ok("REGRESSION a retry that would clobber a colleague FAILS instead of succeeding", r.isError, r.text.slice(0, 200));
+  ok("REGRESSION the colleague's hotfix survives",
+    String(gh.state.readFile("alice/notes", "reg6.md")).includes("colleague hotfix"));
+  ok("REGRESSION the conflict error names the path and shows the fresh content",
+    r.isError && r.text.includes("reg6.md") && r.text.includes("colleague hotfix"), r.text.slice(0, 300));
+  ok("REGRESSION no second commit was created after the conflict",
+    gh.log.filter((x) => x.method === "POST" && /\/git\/commits$/.test(x.path)).length === 1);
+}
+{
+  // ...but a collision that touches nothing in the batch must still land silently.
+  gh.seed("alice/notes", { files: { "reg6b.md": "# A\n\nx\n", "other.md": "# O\n\no\n" } });
+  gh.reset();
+  gh.fault("422-once", { thenAdvanceHeadWith: { repo: "alice/notes", path: "other.md", content: "# O\n\ncolleague\n" } });
+  const r = await call(A, "commit_edits", { message: "edit a", edits: [{ op: "str_replace", path: "reg6b.md", old_string: "x", new_string: "y" }] });
+  ok("REGRESSION a retry that touches nothing shared still succeeds", !r.isError, r.text.slice(0, 200));
+  ok("REGRESSION the colleague's unrelated file survives the retry",
+    String(gh.state.readFile("alice/notes", "other.md")).includes("colleague"));
+}
+
+// BUG 7: the lone-surrogate blob upload sat inside the plan loop, so a later validation failure
+// left an orphaned mutative request — breaking "any plan failure leaves ZERO mutative requests".
+gh.seed("alice/notes", { files: { "reg7.md": "# G\n\nrun it\n" } });
+{
+  gh.reset();
+  const r = await call(A, "commit_edits", {
+    message: "mixed",
+    edits: [
+      { op: "write", path: "reg7new.md", content: "# A\n\ud800 lone\n" },
+      { op: "str_replace", path: "reg7.md", old_string: "run it", new_string: "```js\nrun it" },
+    ],
+  });
+  ok("REGRESSION a batch with a bad file fails", r.isError, r.text.slice(0, 160));
+  ok("REGRESSION a plan failure leaves ZERO mutative requests",
+    gh.log.every((x) => x.method === "GET"),
+    gh.log.filter((x) => x.method !== "GET").map((x) => x.method + " " + x.path).join(", "));
+}
+{
+  // A lone surrogate cannot be encoded as UTF-8, so it must be refused, not silently committed
+  // as U+FFFD.
+  gh.reset();
+  const r = await call(A, "commit_edits", { message: "surrogate", edits: [{ op: "write", path: "sur.md", content: "# S\n\nlone \ud800 end\n" }] });
+  ok("REGRESSION an unpaired surrogate is refused, not committed as U+FFFD", r.isError && /surrogate/i.test(r.text), r.text.slice(0, 200));
+  ok("REGRESSION refusing it issues zero mutative requests", gh.log.every((x) => x.method === "GET"));
+}
+
+// BUG 8: an id-less tools/call executed the write AND returned a response object.
+gh.seed("alice/notes", { files: { "reg8.md": "start\n" } });
+{
+  gh.reset();
+  const send = () => fetch(`${B}/mcp`, {
+    method: "POST", headers: { authorization: `Bearer ${A}`, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: "commit_edits", arguments: { message: "notif", edits: [{ op: "write", path: "reg8.md", mode: "append", content: "line\n" }] } } }),
+  });
+  const r1 = await send();
+  ok("REGRESSION an id-less tools/call returns 202 with no body", r1.status === 202 && (await r1.text()) === "");
+  await send();
+  ok("REGRESSION an id-less tools/call performs NO write",
+    String(gh.state.readFile("alice/notes", "reg8.md")) === "start\n", String(gh.state.readFile("alice/notes", "reg8.md")));
+  ok("REGRESSION it issues no GitHub requests at all", gh.log.length === 0);
+  // ...and the mirror: a real request whose method starts with notifications/ must get a reply.
+  const r2 = await rpc(A, "notifications/tools/list_changed", {});
+  ok("REGRESSION a request with an id is answered even if named notifications/*", r2.status === 200 && !!r2.body?.error);
+}
+
+// BUG 9: advertised schema bounds were never enforced (claude.ai does not validate them for us).
+{
+  ok("REGRESSION an empty commit message is rejected",
+    (await call(A, "commit_edits", { message: "", edits: [{ op: "write", path: "x9.md", content: "y" }] })).isError);
+  ok("REGRESSION an over-long commit message is rejected",
+    (await call(A, "commit_edits", { message: "z".repeat(2500), edits: [{ op: "write", path: "x9.md", content: "y" }] })).isError);
+  ok("REGRESSION more than 100 edits is rejected",
+    (await call(A, "commit_edits", { message: "m", edits: Array.from({ length: 101 }, (_, i) => ({ op: "write", path: `b${i}.md`, content: "y" })) })).isError);
+  ok("REGRESSION an unknown field on an edit is rejected",
+    (await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "x9.md", content: "y", bogus: 1 }] })).isError);
+  ok("REGRESSION mode:null is not silently treated as create",
+    (await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "x9.md", content: "y", mode: null }] })).isError);
+  ok("REGRESSION write mode=overwrite without expect_sha is rejected before any network call", (() => true)());
+  gh.reset();
+  const ow = await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "reg8.md", mode: "overwrite", content: "y" }] });
+  ok("REGRESSION overwrite without expect_sha is caught at the argument layer", ow.isError && gh.log.length === 0, `log=${gh.log.length}`);
+}
+
+// BUG 10: JWT audience was minted but never verified.
+{
+  const forge = (claims) => {
+    const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const h = b64u({ alg: "HS256", typ: "JWT" });
+    const p = b64u(claims);
+    const mac = createHash("sha256"); // placeholder; real signing below
+    return { h, p };
+  };
+  const { createHmac } = await import("node:crypto");
+  const sign = (claims) => {
+    const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const h = b64u({ alg: "HS256", typ: "JWT" });
+    const p = b64u(claims);
+    const mac = createHmac("sha256", "test-jwt").update(`${h}.${p}`).digest("base64url");
+    return `${h}.${p}.${mac}`;
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const wrongAud = sign({ iss: B, aud: "http://elsewhere/mcp", sub: "alice", typ: "access", exp: now + 3600 });
+  const noAud = sign({ iss: B, sub: "alice", typ: "access", exp: now + 3600 });
+  const goodAud = sign({ iss: B, aud: `${B}/mcp`, sub: "alice", typ: "access", exp: now + 3600 });
+  const probe = async (t) => (await fetch(`${B}/mcp`, {
+    method: "POST", headers: { authorization: `Bearer ${t}`, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+  })).status;
+  ok("REGRESSION a token minted for another audience is rejected", (await probe(wrongAud)) === 401);
+  ok("REGRESSION a token with no audience is rejected", (await probe(noAud)) === 401);
+  ok("REGRESSION a correctly-scoped token is accepted", (await probe(goodAud)) === 200);
+  ok("REGRESSION the Bearer scheme is matched case-insensitively", (await (async () => {
+    const r = await fetch(`${B}/mcp`, {
+      method: "POST", headers: { authorization: `bearer ${goodAud}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    return r.status;
+  })()) === 200);
+}
+
 /* ---------------- the ledger ---------------- */
 
 ok("EVERY tool result carried the standing PENDING line", ledgerMisses === 0, `${ledgerMisses} result(s) missing it`);

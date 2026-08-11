@@ -41,10 +41,11 @@ function ledger(sub: string): string {
   const held = lastFailure.get(sub);
   let out = `\n\n${PENDING_LINE}`;
   if (held) {
-    const mins = Math.max(1, Math.round((Date.now() - held.failedAt) / 60_000));
-    const left = Math.max(1, Math.round((RETENTION_MS - (Date.now() - held.failedAt)) / 60_000));
+    const age = Date.now() - held.failedAt;
+    const mins = age < 60_000 ? `${Math.max(1, Math.round(age / 1000))}s` : `${Math.round(age / 60_000)}m`;
+    const left = Math.max(1, Math.round((RETENTION_MS - age) / 60_000));
     out +=
-      `\nNOTE: a batch you sent ${mins}m ago failed and is held as retry_ref ${held.ref} ` +
+      `\nNOTE: a batch you sent ${mins} ago failed and is held as retry_ref ${held.ref} ` +
       `(${held.edits.length} operations, "${held.message}" — ${held.reason}). ` +
       `Resend it with commit_edits({message, retry_ref:"${held.ref}"}). It expires in ${left}m and lives in server memory only; a restart drops it.`;
   }
@@ -183,9 +184,15 @@ function str(v: unknown, field: string): string {
 
 /** Normalize the flat wire shape into the discriminated Edit union, enforcing the
     per-op requirements the flat schema cannot express. */
+const EDIT_KEYS = new Set(["op", "path", "content", "mode", "old_string", "new_string", "replace_all", "heading", "expect_sha"]);
+
 function coerceEdit(raw: unknown, i: number): Edit {
-  if (!raw || typeof raw !== "object") throw new ToolError(`edits[${i}] must be an object.`);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ToolError(`edits[${i}] must be an object.`);
   const e = raw as Record<string, unknown>;
+  // additionalProperties:false is advertised in the schema, and nothing validates it for us:
+  // claude.ai does not enforce server-side schemas, so a stray key would be silently dropped.
+  const unknown = Object.keys(e).filter((k) => !EDIT_KEYS.has(k));
+  if (unknown.length) throw new ToolError(`edits[${i}] has unknown field(s): ${unknown.join(", ")}. Allowed: ${[...EDIT_KEYS].join(", ")}.`);
   const op = e.op;
   const path = str(e.path, `edits[${i}].path`);
   const sha = e.expect_sha === undefined ? undefined : str(e.expect_sha, `edits[${i}].expect_sha`);
@@ -194,9 +201,18 @@ function coerceEdit(raw: unknown, i: number): Edit {
   }
 
   if (op === "write") {
-    const mode = (e.mode ?? "create") as string;
+    // `?? "create"` would let an explicit null mean create, unlike every neighbouring check.
+    const mode = (e.mode === undefined ? "create" : e.mode) as string;
     if (!["create", "overwrite", "append"].includes(mode)) {
-      throw new ToolError(`edits[${i}]: op=write takes mode "create", "overwrite" or "append" (got "${mode}").`);
+      throw new ToolError(`edits[${i}]: op=write takes mode "create", "overwrite" or "append" (got ${JSON.stringify(e.mode)}).`);
+    }
+    // expect_sha is required wherever an op destroys a whole file. Enforced here AND in
+    // shaGuard: a single layer means deleting one guard silently permits a blind overwrite.
+    if (mode === "overwrite" && !sha) {
+      throw new ToolError(
+        `edits[${i}]: write mode="overwrite" requires expect_sha (the file's current blob SHA, from read_md or list_md). ` +
+          `Refusing to replace a whole file that was not observed.`
+      );
     }
     return { op: "write", path, content: str(e.content, `edits[${i}].content`), mode: mode as any, expect_sha: sha };
   }
@@ -213,7 +229,7 @@ function coerceEdit(raw: unknown, i: number): Edit {
   if (op === "edit_section") {
     const mode = e.mode as string;
     if (!["replace", "append", "prepend", "delete"].includes(mode)) {
-      throw new ToolError(`edits[${i}]: op=edit_section takes mode "replace", "append", "prepend" or "delete" (got "${String(mode)}").`);
+      throw new ToolError(`edits[${i}]: op=edit_section takes mode "replace", "append", "prepend" or "delete" (got ${JSON.stringify(e.mode)}).`);
     }
     return {
       op: "edit_section",
@@ -268,6 +284,9 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
 
   if (name === "commit_edits") {
     const message = str(args.message, "message");
+    // The schema advertises these bounds; nothing else enforces them.
+    if (!message.trim()) throw new ToolError("message must not be empty — GitHub rejects a commit with no message.");
+    if (message.length > 2000) throw new ToolError(`message is ${message.length} characters; the maximum is 2000.`);
     const hasRef = typeof args.retry_ref === "string" && args.retry_ref;
     const hasEdits = Array.isArray(args.edits);
     if (hasRef && hasEdits) throw new ToolError("Supply either edits or retry_ref, not both.");
@@ -281,6 +300,9 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
       edits = held.edits;
     } else {
       if (!hasEdits || !(args.edits as unknown[]).length) throw new ToolError("edits must be a non-empty array (or supply retry_ref).");
+      if ((args.edits as unknown[]).length > 100) {
+        throw new ToolError(`edits has ${(args.edits as unknown[]).length} operations; the maximum is 100. Split this into several commits.`);
+      }
       edits = (args.edits as unknown[]).map(coerceEdit);
     }
 
@@ -290,7 +312,11 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
     try {
       result = await commitEdits(user, message, edits);
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
+      if (!(err instanceof ToolError || err instanceof EditError)) throw err;
+      const reason = err.message;
+      // Retention exists so a large batch need not be retyped. A batch that can never succeed
+      // as-sent gets no ref: offering to resend it would only produce the same failure.
+      if (/No effective changes/i.test(reason)) return toolError(`${reason}${ledger(user.id)}`);
       const ref = `r_${randomBytes(3).toString("hex")}`;
       lastFailure.set(user.id, { ref, message, edits, failedAt: Date.now(), reason: reason.split("\n")[0]!.slice(0, 160) });
       return toolError(`${reason}\n\nThis batch is held as retry_ref ${ref} — resend it unchanged with commit_edits({message, retry_ref:"${ref}"}) once the cause is fixed.${ledger(user.id)}`);
@@ -327,11 +353,19 @@ const rpcOk = (id: unknown, result: unknown) => ({ jsonrpc: "2.0", id, result })
 
 /** Returns null for notifications (caller answers 202 with an empty body). */
 export async function handleMessage(user: User, msg: any): Promise<object | null> {
-  if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0") return rpcError(null, -32600, "Invalid Request");
-  const isNotification = !("id" in msg) || msg.id === undefined;
+  if (!msg || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0") return rpcError(null, -32600, "Invalid Request");
   const { id, method } = msg;
+  if (typeof method !== "string") return rpcError(id ?? null, -32600, "Invalid Request: method must be a string");
+  if (id !== undefined && id !== null && typeof id !== "string" && typeof id !== "number") {
+    return rpcError(null, -32600, "Invalid Request: id must be a string or number");
+  }
 
-  if (method === "notifications/initialized" || String(method).startsWith("notifications/")) return null;
+  // A notification is fire-and-forget and MAY be retried by the client, so it must never
+  // perform a write and must never get a response. Decided by the absence of `id` alone —
+  // keying off the method name both executed id-less tools/call and hung real requests whose
+  // method merely started with "notifications/".
+  const isNotification = !("id" in msg) || msg.id === undefined;
+  if (isNotification) return null;
 
   if (method === "initialize") {
     const asked = msg.params?.protocolVersion;
@@ -366,6 +400,5 @@ export async function handleMessage(user: User, msg: any): Promise<object | null
     }
   }
 
-  if (isNotification) return null;
-  return rpcError(id, -32601, `Method not found: ${String(method)}`);
+  return rpcError(id, -32601, `Method not found: ${method}`);
 }

@@ -1,11 +1,18 @@
 /* Markdown surgical edits. Pure functions, no I/O.
    The scanner is a real CommonMark block scanner, not a /^#{1,6}/ regex: front matter's
    closing `---` is a legal setext H2 underline, so a naive scan invents a phantom heading
-   named after the last YAML line and an agent would edit straight into the front matter. */
+   named after the last YAML line and an agent would edit straight into the front matter.
+
+   Documents are held as lines PLUS their individual terminators. Editing never rewrites the
+   line endings of lines it did not touch, even in a file with mixed CRLF and LF. */
 
 const HTML1 = /^<(pre|script|style|textarea)(\s|>|$)/i;
 const HTML6 =
   /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(\s|\/?>|$)/i;
+
+/** Markdown blank means spaces and tabs only. JS trim() also strips NBSP, U+3000 and friends,
+    which are ordinary content here — using it would silently delete author's lines. */
+const isBlank = (s: string) => /^[ \t]*$/.test(s);
 
 export type Heading = { level: number; text: string; startLine: number; endLine: number; kind: "atx" | "setext" };
 export type Scan = { headings: Heading[]; frontMatterEnd: number | null; unclosedFenceLine: number | null };
@@ -22,27 +29,29 @@ function indentWidth(line: string): { width: number; offset: number } {
   return { width: w, offset: i };
 }
 
+/** Front matter, not a thematic break: the fence must close, contain no blank line, and hold at
+    least one YAML-looking line. Without this, `---\n\n# A\n...\n---\n` swallows every heading. */
+function frontMatterEndOf(lines: string[]): number | null {
+  if (!lines.length || !/^---[ \t]*$/.test(lines[0]!)) return null;
+  let sawYaml = false;
+  for (let k = 1; k < lines.length; k++) {
+    const l = lines[k]!;
+    if (isBlank(l)) return null;
+    if (/^(---|\.\.\.)[ \t]*$/.test(l)) return sawYaml ? k : null;
+    if (/^[A-Za-z_][\w.-]*[ \t]*:/.test(l) || /^-[ \t]/.test(l) || /^[ \t]+\S/.test(l)) sawYaml = true;
+  }
+  return null;
+}
+
 export function scanHeadings(lines: string[]): Scan {
   const headings: Heading[] = [];
-  let i = 0;
-  let fm: number | null = null;
+  const fm = frontMatterEndOf(lines);
   let fence: { char: string; len: number; indent: number } | null = null;
   let html: { endRe: RegExp | null } | null = null;
   let paraStart = -1;
   let unclosedFence: number | null = null;
 
-  // Front matter only when line 0 is exactly `---` AND a closer exists later.
-  if (lines.length && /^---[ \t]*$/.test(lines[0]!)) {
-    for (let k = 1; k < lines.length; k++) {
-      if (/^(---|\.\.\.)[ \t]*$/.test(lines[k]!)) {
-        fm = k;
-        break;
-      }
-    }
-  }
-  i = fm === null ? 0 : fm + 1;
-
-  for (; i < lines.length; i++) {
+  for (let i = fm === null ? 0 : fm + 1; i < lines.length; i++) {
     const line = lines[i]!;
 
     if (fence) {
@@ -54,10 +63,10 @@ export function scanHeadings(lines: string[]): Scan {
     if (html) {
       if (html.endRe) {
         if (html.endRe.test(line)) html = null;
-      } else if (/^[ \t]*$/.test(line)) html = null;
+      } else if (isBlank(line)) html = null;
       continue;
     }
-    if (/^[ \t]*$/.test(line)) {
+    if (isBlank(line)) {
       paraStart = -1;
       continue;
     }
@@ -83,13 +92,25 @@ export function scanHeadings(lines: string[]): Scan {
       continue;
     }
 
+    // HTML blocks. CommonMark: "the start line can also be the end line", so the end condition
+    // MUST be tested on the opener itself. Without this a one-line `<!-- toc -->` — the single
+    // most common HTML in markdown — wedges the scanner open to EOF, every later heading
+    // disappears, and editing the preceding section deletes the rest of the file.
     if (rest[0] === "<") {
-      if (HTML1.test(rest)) { html = { endRe: /<\/(pre|script|style|textarea)>/i }; paraStart = -1; continue; }
-      if (rest.startsWith("<!--")) { html = { endRe: /-->/ }; paraStart = -1; continue; }
-      if (rest.startsWith("<?")) { html = { endRe: /\?>/ }; paraStart = -1; continue; }
-      if (/^<![A-Za-z]/.test(rest)) { html = { endRe: />/ }; paraStart = -1; continue; }
-      if (rest.startsWith("<![CDATA[")) { html = { endRe: /\]\]>/ }; paraStart = -1; continue; }
-      if (HTML6.test(rest)) { html = { endRe: null }; paraStart = -1; continue; }
+      // An end condition satisfied on the opener itself closes the block immediately.
+      const opened = (endRe: RegExp | null) => (endRe && endRe.test(rest) ? null : { endRe });
+      let matched = true;
+      if (HTML1.test(rest)) html = opened(/<\/(pre|script|style|textarea)>/i);
+      else if (rest.startsWith("<!--")) html = opened(/-->/);
+      else if (rest.startsWith("<?")) html = opened(/\?>/);
+      else if (rest.startsWith("<![CDATA[")) html = opened(/\]\]>/);
+      else if (/^<![A-Za-z]/.test(rest)) html = opened(/>/);
+      else if (HTML6.test(rest)) html = opened(null); // type 6 ends at a blank line, never on itself
+      else matched = false;
+      if (matched) {
+        paraStart = -1;
+        continue;
+      }
     }
 
     if (rest[0] === ">") { paraStart = -1; continue; } // blockquote: nested doc, not addressable
@@ -129,32 +150,102 @@ export function sectionSpan(headings: Heading[], idx: number, totalLines: number
   return { start: h.startLine, bodyStart: h.endLine + 1, end };
 }
 
-/* ---------------- byte fidelity ---------------- */
+/* ---------------- the document model ---------------- */
 
 export type Doc = {
-  bom: string;      // leading U+FEFF, split off so an anchor at file start can match
-  eol: "\n" | "\r\n";
-  text: string;     // LF-normalized view, BOM removed
-  original: string; // exact original bytes minus BOM
+  bom: string;
+  eol: "\n" | "\r\n"; // used only for lines this edit CREATES
+  lines: string[];
+  eols: string[];     // terminator after each line; "" on the last when there is no trailing newline
+  text: string;       // LF view, for matching only
+  endedWithNewline: boolean;
 };
 
-/** An old_string anchored at file start silently never matches with a BOM present
-    (indexOf returns 1, not 0), so the BOM is split off before matching. */
+function build(bom: string, lines: string[], eols: string[], eol: "\n" | "\r\n"): Doc {
+  return {
+    bom,
+    eol,
+    lines,
+    eols,
+    text: lines.join("\n"),
+    endedWithNewline: eols.length > 0 && eols[eols.length - 1] !== "",
+  };
+}
+
+/** A leading U+FEFF is split off: otherwise an old_string anchored at file start silently never
+    matches, because indexOf returns 1 rather than 0. */
 export function parseDoc(raw: string): Doc {
   const bom = raw.startsWith("﻿") ? "﻿" : "";
-  const original = bom ? raw.slice(1) : raw;
-  const crlf = (original.match(/\r\n/g) || []).length;
-  const lf = (original.match(/(?<!\r)\n/g) || []).length;
-  const eol: "\n" | "\r\n" = crlf > lf ? "\r\n" : "\n";
-  return { bom, eol, text: original.replace(/\r\n/g, "\n"), original };
+  const body = bom ? raw.slice(1) : raw;
+  const lines: string[] = [];
+  const eols: string[] = [];
+  let i = 0;
+  for (;;) {
+    const nl = body.indexOf("\n", i);
+    if (nl === -1) {
+      lines.push(body.slice(i));
+      eols.push("");
+      break;
+    }
+    const cr = nl > i && body[nl - 1] === "\r";
+    lines.push(body.slice(i, cr ? nl - 1 : nl));
+    eols.push(cr ? "\r\n" : "\n");
+    i = nl + 1;
+    if (i === body.length) break; // trailing newline: no phantom empty final line
+  }
+  const crlf = eols.filter((e) => e === "\r\n").length;
+  const lf = eols.filter((e) => e === "\n").length;
+  return build(bom, lines, eols, crlf > lf ? "\r\n" : "\n");
 }
 
-/** Render an LF-normalized string back out in the document's own line ending. */
-export function render(doc: Doc, text: string): string {
-  return doc.bom + (doc.eol === "\r\n" ? text.replace(/\n/g, "\r\n") : text);
+export function render(doc: Doc): string {
+  let out = doc.bom;
+  for (let i = 0; i < doc.lines.length; i++) out += doc.lines[i]! + (doc.eols[i] ?? "");
+  return out;
 }
 
-export const lineOf = (text: string, index: number) => text.slice(0, index).split("\n").length; // 1-based
+/** Replace a line range. Lines outside [from,to) keep their own terminators byte for byte. */
+function replaceLines(doc: Doc, from: number, to: number, newLines: string[]): Doc {
+  const lines = [...doc.lines.slice(0, from), ...newLines, ...doc.lines.slice(to)];
+  const head = doc.eols.slice(0, from);
+  const tail = doc.eols.slice(to);
+  const mid: string[] = [];
+  for (let i = 0; i < newLines.length; i++) {
+    // Reuse the terminator of the line that used to sit here; invent one only for genuinely new lines.
+    mid.push(from + i < to ? doc.eols[from + i]! : doc.eol);
+  }
+  // The final line of the document must not gain a terminator it never had.
+  if (!tail.length && mid.length) {
+    const lastOld = to > 0 ? doc.eols[to - 1] ?? "" : "";
+    mid[mid.length - 1] = to <= doc.lines.length && to > from ? lastOld : doc.endedWithNewline ? doc.eol : "";
+  }
+  return build(doc.bom, lines, [...head, ...mid, ...tail], doc.eol);
+}
+
+export const lineOf = (doc: Doc, index: number) => offsetToLine(lineStarts(doc), index) + 1; // 1-based
+
+function lineStarts(doc: Doc): number[] {
+  const starts: number[] = new Array(doc.lines.length);
+  let off = 0;
+  for (let i = 0; i < doc.lines.length; i++) {
+    starts[i] = off;
+    off += doc.lines[i]!.length + 1; // +1 for the LF in the view
+  }
+  return starts;
+}
+
+/** Binary search. Doing this with slice().split() per hit is O(n * hits) and has been measured
+    stalling the whole (single-threaded) server for tens of seconds on a large replace_all. */
+function offsetToLine(starts: number[], index: number): number {
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid]! <= index) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
 
 /* ---------------- error type ---------------- */
 
@@ -174,7 +265,7 @@ const trigrams = (s: string) => {
 };
 
 /** Trigram Jaccard against the needle's first non-blank line. Deliberately NOT fuzzy
-    replacement — aider ships theirs disabled; a wrong guess is silent corruption. */
+    replacement — a wrong guess about which bytes to overwrite is silent corruption. */
 export function nearMisses(text: string, needle: string, limit = 4): string[] {
   const first = needle.split("\n").find((l) => l.trim()) || needle;
   const want = trigrams(first);
@@ -198,15 +289,13 @@ export function nearMisses(text: string, needle: string, limit = 4): string[] {
 
 /* ---------------- ops ---------------- */
 
-/** Exact-match replacement. Matching runs on the LF view; offsets are mapped back so a
-    one-line edit to a CRLF file does not rewrite every line ending into the diff. */
 export function strReplace(
   doc: Doc,
   path: string,
   oldString: string,
   newString: string,
   replaceAll: boolean
-): { text: string; note: string } {
+): { doc: Doc; note: string } {
   if (!oldString) fail("old_string must not be empty.");
   if (oldString === newString) fail("No replacement was performed: new_string and old_string must be different.");
 
@@ -215,21 +304,24 @@ export function strReplace(
   const hay = doc.text;
 
   const hits: number[] = [];
-  for (let i = hay.indexOf(needle); i !== -1; i = hay.indexOf(needle, i + 1)) hits.push(i);
+  // Advance by needle.length: overlapping matches are not separate replacements, and counting
+  // them inflates the reported count and corrupts the splice.
+  for (let i = hay.indexOf(needle); i !== -1; i = hay.indexOf(needle, i + needle.length)) hits.push(i);
+
+  const starts = lineStarts(doc);
+  const lineAt = (off: number) => offsetToLine(starts, off) + 1;
 
   if (hits.length === 0) {
-    // Recovery ladder: indent-insensitive, then whitespace-collapsed. A retry that yields
-    // exactly one match splices the ORIGINAL span, so the write stays byte-exact.
-    const relaxed = relaxedFind(hay, needle);
+    const relaxed = relaxedFind(doc, needle);
     if (relaxed) {
-      const out = hay.slice(0, relaxed.start) + repl + hay.slice(relaxed.end);
-      return { text: out, note: `matched after normalizing leading indentation (line ${lineOf(hay, relaxed.start)})` };
+      const out = spliceRange(doc, relaxed.startLine, relaxed.endLine, relaxed.pad, repl);
+      return { doc: out, note: `matched after normalizing leading indentation (line ${relaxed.startLine + 1})` };
     }
     let msg =
       `No replacement was performed: old_string did not appear verbatim in ${path}. ` +
       `The text must match exactly, including whitespace and indentation.`;
     if (repl && hay.includes(repl)) {
-      msg += ` Note: new_string already appears in ${path} at line ${lineOf(hay, hay.indexOf(repl))} — this edit may already have landed.`;
+      msg += ` Note: new_string already appears in ${path} at line ${lineAt(hay.indexOf(repl))} — this edit may already have landed.`;
     }
     const cands = nearMisses(hay, needle);
     if (cands.length) msg += `\nDid you mean to match one of these actual lines from ${path}?\n${cands.join("\n")}`;
@@ -237,62 +329,98 @@ export function strReplace(
   }
 
   if (hits.length > 1 && !replaceAll) {
-    const lines = hits.map((h) => lineOf(hay, h)).join(", ");
     fail(
-      `Found ${hits.length} matches for old_string in ${path} (lines ${lines}). ` +
+      `Found ${hits.length} matches for old_string in ${path} (lines ${hits.map(lineAt).join(", ")}). ` +
         `Provide more surrounding context to target one, or set replace_all=true to change all ${hits.length}.`
     );
   }
 
-  if (replaceAll) {
-    const lines = hits.map((h) => lineOf(hay, h));
-    let out = "";
-    let cur = 0;
-    for (const h of hits) {
-      out += hay.slice(cur, h) + repl;
-      cur = h + needle.length;
-    }
-    out += hay.slice(cur);
-    return { text: out, note: `replaced ${hits.length} occurrence(s) at line(s) ${lines.join(", ")}` };
+  // Rebuild the LF view once, then re-split into lines and re-attach terminators positionally.
+  let out = "";
+  let cur = 0;
+  for (const h of hits) {
+    out += hay.slice(cur, h) + repl;
+    cur = h + needle.length;
   }
+  out += hay.slice(cur);
 
-  const at = hits[0]!;
-  return { text: hay.slice(0, at) + repl + hay.slice(at + needle.length), note: `replaced 1 occurrence at line ${lineOf(hay, at)}` };
+  const first = offsetToLine(starts, hits[0]!);
+  const last = offsetToLine(starts, hits[hits.length - 1]! + needle.length);
+  const newDoc = rebuild(doc, out, first, last);
+  const note = replaceAll
+    ? `replaced ${hits.length} occurrence(s) at line(s) ${hits.map(lineAt).join(", ")}`
+    : `replaced 1 occurrence at line ${lineAt(hits[0]!)}`;
+  return { doc: newDoc, note };
 }
 
-function relaxedFind(hay: string, needle: string): { start: number; end: number } | null {
-  const strip = (s: string) => s.split("\n").map((l) => l.replace(/^[ \t]+/, "")).join("\n");
-  const nStrip = strip(needle);
-  const hLines = hay.split("\n");
-  const nLines = nStrip.split("\n");
+/** Re-derive lines from an edited LF view, preserving the terminators of every line outside
+    the touched range [firstLine, lastLine]. */
+function rebuild(doc: Doc, newText: string, firstLine: number, lastLine: number): Doc {
+  const newLines = newText.split("\n");
+  const headCount = firstLine;
+  const tailCount = doc.lines.length - 1 - lastLine;
+  const eols: string[] = [];
+  for (let i = 0; i < newLines.length; i++) {
+    if (i < headCount) eols.push(doc.eols[i]!);
+    else if (i >= newLines.length - tailCount) eols.push(doc.eols[doc.lines.length - (newLines.length - i)]!);
+    else eols.push(doc.eol);
+  }
+  if (eols.length) {
+    const lastOld = doc.eols[doc.eols.length - 1] ?? "";
+    if (tailCount <= 0) eols[eols.length - 1] = lastOld;
+  }
+  return build(doc.bom, newLines, eols, doc.eol);
+}
+
+/** Replace whole lines [startLine,endLine] with `repl`, re-applying the original indentation. */
+function spliceRange(doc: Doc, startLine: number, endLine: number, pad: string, repl: string): Doc {
+  const replLines = repl.split("\n").map((l) => (l === "" ? l : pad + l));
+  return replaceLines(doc, startLine, endLine + 1, replLines);
+}
+
+/** Indent-insensitive recovery. Only accepts a match whose lines share ONE leading-whitespace
+    prefix, and re-applies that prefix — otherwise the "recovery" strips real indentation and
+    turns an indented code block into a live heading. */
+function relaxedFind(doc: Doc, needle: string): { startLine: number; endLine: number; pad: string } | null {
+  const nLines = needle.split("\n").map((l) => l.replace(/^[ \t]*/, ""));
+  const hLines = doc.lines;
   const found: number[] = [];
   for (let i = 0; i + nLines.length <= hLines.length; i++) {
     let ok = true;
     for (let j = 0; j < nLines.length; j++) {
-      if (hLines[i + j]!.replace(/^[ \t]+/, "") !== nLines[j]) { ok = false; break; }
+      if (hLines[i + j]!.replace(/^[ \t]*/, "") !== nLines[j]) { ok = false; break; }
     }
     if (ok) found.push(i);
   }
   if (found.length !== 1) return null;
   const startLine = found[0]!;
-  const start = hLines.slice(0, startLine).reduce((a, l) => a + l.length + 1, 0);
-  const end = start + hLines.slice(startLine, startLine + nLines.length).join("\n").length;
-  return { start, end };
+  const endLine = startLine + nLines.length - 1;
+  const pads = new Set<string>();
+  for (let i = startLine; i <= endLine; i++) {
+    if (!isBlank(hLines[i]!)) pads.add(/^[ \t]*/.exec(hLines[i]!)![0]);
+  }
+  if (pads.size > 1) return null; // ragged indentation: refuse rather than guess
+  return { startLine, endLine, pad: [...pads][0] ?? "" };
 }
 
-/** Resolve a heading by exact text, a `Guide > Install` breadcrumb, or a `Notes#2` index.
-    Ambiguity is always an error — never first-match-wins. */
-export function resolveHeading(scan: Scan, lines: string[], spec: string, path: string): number {
+/** Resolve a heading by literal text first, then by `Guide > Install` breadcrumb or a `Notes#2`
+    index. Literal-first is what makes headings like `## Issue #42` and `## A > B` addressable
+    at all — parsing the sigils unconditionally silently retargets a different section. */
+export function resolveHeading(scan: Scan, spec: string, path: string): number {
   const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-  const outline = () =>
-    scan.headings.map((h) => `  L${h.level} ${h.text || "(empty)"} (line ${h.startLine + 1}) [${breadcrumb(scan, scan.headings.indexOf(h))}]`).join("\n");
+  const all = scan.headings.map((h, i) => ({ h, i }));
+  const outline = () => all.map((x) => `  L${x.h.level} ${x.h.text || "(empty)"} (line ${x.h.startLine + 1}) [${breadcrumb(scan, x.i)}]`).join("\n");
+
+  const exact = all.filter((x) => norm(x.h.text) === norm(spec));
+  if (exact.length === 1) return exact[0]!.i;
+  if (exact.length > 1) return ambiguous(scan, exact, spec, path);
 
   let want = norm(spec);
   let occurrence: number | null = null;
-  const idxMatch = /^(.*)#(\d+)$/.exec(want);
-  if (idxMatch) {
-    want = norm(idxMatch[1]!);
-    occurrence = Number(idxMatch[2]);
+  const idx = /^(.*?)\s*#(\d+)$/.exec(want);
+  if (idx) {
+    want = norm(idx[1]!);
+    occurrence = Number(idx[2]);
   }
   let crumbs: string[] | null = null;
   if (want.includes(">")) {
@@ -300,13 +428,19 @@ export function resolveHeading(scan: Scan, lines: string[], spec: string, path: 
     want = crumbs[crumbs.length - 1]!;
   }
 
-  let cands = scan.headings.map((h, i) => ({ h, i })).filter((x) => norm(x.h.text) === want);
-  if (!cands.length) cands = scan.headings.map((h, i) => ({ h, i })).filter((x) => norm(x.h.text).toLowerCase() === want.toLowerCase());
+  let cands = all.filter((x) => norm(x.h.text) === want);
+  if (!cands.length) cands = all.filter((x) => norm(x.h.text).toLowerCase() === want.toLowerCase());
 
   if (crumbs && crumbs.length > 1) {
     cands = cands.filter((x) => {
       const bc = breadcrumb(scan, x.i).split(" > ").map(norm);
-      return crumbs!.every((c) => bc.includes(c));
+      let at = 0;
+      for (const c of crumbs!) {
+        const found = bc.indexOf(c, at);
+        if (found === -1) return false; // ancestors must appear IN ORDER
+        at = found + 1;
+      }
+      return true;
     });
   }
 
@@ -324,17 +458,18 @@ export function resolveHeading(scan: Scan, lines: string[], spec: string, path: 
   if (occurrence !== null) {
     const pick = cands[occurrence - 1];
     if (!pick) fail(`"${spec}" asks for occurrence ${occurrence} but only ${cands.length} heading(s) match in ${path}.\n${outline()}`);
-    return pick!.i;
+    return pick.i;
   }
-
-  if (cands.length > 1) {
-    const list = cands.map((x) => `L${x.h.level} ${x.h.text} (line ${x.h.startLine + 1}) [${breadcrumb(scan, x.i)}]`).join("; ");
-    fail(
-      `"${spec}" matches ${cands.length} headings in ${path}: ${list}. ` +
-        `Pass a breadcrumb such as "${breadcrumb(scan, cands[0]!.i)}", or an occurrence index such as "${want}#2".`
-    );
-  }
+  if (cands.length > 1) return ambiguous(scan, cands, spec, path);
   return cands[0]!.i;
+}
+
+function ambiguous(scan: Scan, cands: { h: Heading; i: number }[], spec: string, path: string): never {
+  const list = cands.map((x) => `L${x.h.level} ${x.h.text} (line ${x.h.startLine + 1}) [${breadcrumb(scan, x.i)}]`).join("; ");
+  fail(
+    `"${spec}" matches ${cands.length} headings in ${path}: ${list}. ` +
+      `Pass a breadcrumb such as "${breadcrumb(scan, cands[0]!.i)}", or an occurrence index such as "${spec}#2".`
+  );
 }
 
 function breadcrumb(scan: Scan, idx: number): string {
@@ -357,30 +492,26 @@ export function editSection(
   headingSpec: string,
   mode: "replace" | "append" | "prepend" | "delete",
   content: string | undefined
-): { text: string; note: string } {
+): { doc: Doc; note: string } {
   if (mode === "delete" && content !== undefined) fail("edit_section mode=delete does not take content.");
   if (mode !== "delete" && content === undefined) fail(`edit_section mode=${mode} requires content.`);
 
-  const lines = doc.text.split("\n");
-  const scan = scanHeadings(lines);
-  const idx = resolveHeading(scan, lines, headingSpec, path);
-  const span = sectionSpan(scan.headings, idx, lines.length);
+  const scan = scanHeadings(doc.lines);
+  const idx = resolveHeading(scan, headingSpec, path);
+  const span = sectionSpan(scan.headings, idx, doc.lines.length);
+  const label = scan.headings[idx]!.text || "(empty)";
 
   const body = (content ?? "").replace(/\r\n/g, "\n");
   const bodyLines = body === "" ? [] : body.replace(/\n+$/, "").split("\n");
-  const label = scan.headings[idx]!.text || "(empty)";
 
   if (mode === "delete") {
-    const out = [...lines.slice(0, span.start), ...lines.slice(span.end)];
     return {
-      text: out.join("\n"),
+      doc: replaceLines(doc, span.start, span.end, []),
       note: `deleted section "${label}" (${span.end - span.start} lines, from line ${span.start + 1})`,
     };
   }
 
-  const head = lines.slice(0, span.bodyStart); // everything up to and including the heading
-  const tail = lines.slice(span.end);
-  let section = lines.slice(span.bodyStart, span.end);
+  let section = doc.lines.slice(span.bodyStart, span.end);
   let note: string;
 
   if (mode === "replace") {
@@ -390,23 +521,26 @@ export function editSection(
     note = `prepended ${bodyLines.length} line(s) after "${label}"`;
     section = [...bodyLines, ...section];
   } else {
-    while (section.length && !section[section.length - 1]!.trim()) section.pop();
+    while (section.length && isBlank(section[section.length - 1]!)) section.pop();
     note = `appended ${bodyLines.length} line(s) to "${label}"`;
     section = [...section, ...bodyLines];
   }
 
   // Exactly one blank line before whatever follows, but only when something follows.
-  if (tail.some((l) => l.trim())) {
-    while (section.length && !section[section.length - 1]!.trim()) section.pop();
+  if (doc.lines.slice(span.end).some((l) => !isBlank(l))) {
+    while (section.length && isBlank(section[section.length - 1]!)) section.pop();
     section.push("");
   }
 
-  return { text: [...head, ...section, ...tail].join("\n"), note };
+  return { doc: replaceLines(doc, span.bodyStart, span.end, section), note };
 }
 
-/** Two delta invariants only. Checked before AND after, so a pre-existing problem
-    is never blamed on this edit. There is no such thing as invalid markdown. */
-export function deltaInvariants(before: string, after: string, path: string): string[] {
+/** Two delta invariants only. Checked before AND after, so a pre-existing problem is never
+    blamed on this edit. Skipped entirely for a file being created: a document that does not
+    exist has no delta, and blaming it for "gaining" front matter makes every Jekyll/Hugo/
+    Obsidian note impossible to create. */
+export function deltaInvariants(before: string, after: string, path: string, isNew: boolean): string[] {
+  if (isNew) return [];
   const warn: string[] = [];
   const b = scanHeadings(before.split("\n"));
   const a = scanHeadings(after.split("\n"));
