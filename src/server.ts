@@ -122,7 +122,7 @@ const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 /* ---------------- consent page ---------------- */
 
 function consentPage(q: URLSearchParams, error?: string): string {
-  const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "resource"]
+  const hidden = ["response_type", "client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "resource"]
     .filter((k) => q.get(k))
     .map((k) => `<input type="hidden" name="${k}" value="${esc(q.get(k)!)}">`)
     .join("");

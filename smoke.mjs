@@ -35,22 +35,29 @@ const bad = await fetch(`${B}/authorize?` + new URLSearchParams({ ...Object.from
 ok("rejects non-allowlisted redirect_uri", bad.status === 400);
 
 const page = await fetch(`${B}/authorize?${q}`);
-ok("consent page renders", page.status === 200 && (await page.text()).includes('name="secret"'));
+const pageHtml = await page.text();
+ok("consent page renders", page.status === 200 && pageHtml.includes('name="secret"'));
 
-const wrong = await fetch(`${B}/authorize`, {
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({ ...Object.fromEntries(q), secret: "nope" }),
-  redirect: "manual",
-});
+// Submit exactly what the rendered form carries — a hidden field the page forgets
+// (e.g. response_type) must fail here, not in production.
+const formFields = (html) =>
+  new URLSearchParams([...html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)].map((m) => [m[1], m[2]]));
+const submit = (secret, html = pageHtml) =>
+  fetch(`${B}/authorize`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams([...formFields(html), ["secret", secret]]),
+    redirect: "manual",
+  });
+ok("form round-trips every param /authorize requires", ["response_type", "client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state"].every((k) => formFields(pageHtml).has(k)));
+
+const wrong = await submit("nope");
+const wrongHtml = await wrong.text();
 ok("wrong secret rejected", wrong.status === 401);
+ok("retry after wrong secret still carries every param", formFields(wrongHtml).get("response_type") === "code");
 
-const good = await fetch(`${B}/authorize`, {
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({ ...Object.fromEntries(q), secret: "secret-alice" }),
-  redirect: "manual",
-});
+// the re-rendered error page must itself be submittable
+const good = await submit("secret-alice", wrongHtml);
 const loc = new URL(good.headers.get("location"));
 const code = loc.searchParams.get("code");
 ok("consent redirects with code+state", good.status === 302 && !!code && loc.searchParams.get("state") === "xyz" && loc.origin === "https://claude.ai");
@@ -63,12 +70,7 @@ const badPkce = await fetch(`${B}/token`, {
 ok("PKCE mismatch rejected", badPkce.status === 400);
 
 // code was consumed by the failed attempt -> get a fresh one
-const good2 = await fetch(`${B}/authorize`, {
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({ ...Object.fromEntries(q), secret: "secret-alice" }),
-  redirect: "manual",
-});
+const good2 = await submit("secret-alice");
 const code2 = new URL(good2.headers.get("location")).searchParams.get("code");
 
 const tok = await (await fetch(`${B}/token`, {
@@ -94,12 +96,7 @@ ok("refresh_token grant works", !!ref.access_token);
 
 // second user: their own secret must mint a token bound to their own identity
 const sub = (t) => JSON.parse(Buffer.from(t.split(".")[1], "base64url").toString()).sub;
-const bobRedirect = await fetch(`${B}/authorize`, {
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({ ...Object.fromEntries(q), secret: "secret-bob" }),
-  redirect: "manual",
-});
+const bobRedirect = await submit("secret-bob");
 const bobCode = new URL(bobRedirect.headers.get("location")).searchParams.get("code");
 const bobTok = await (await fetch(`${B}/token`, {
   method: "POST",
