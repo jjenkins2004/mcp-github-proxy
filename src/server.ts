@@ -1,11 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { Readable } from "node:stream";
+import type { User } from "./github.js";
+import { handleMessage, onShutdown, sweep } from "./mcp.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = req("JWT_SECRET");
 const PUBLIC_URL = req("PUBLIC_URL").replace(/\/+$/, "");
-const UPSTREAM_MCP_URL = process.env.UPSTREAM_MCP_URL || "https://api.githubcopilot.com/mcp/";
 
 const REDIRECT_ALLOWLIST = new Set([
   "https://claude.ai/api/mcp/auth_callback",
@@ -18,23 +18,32 @@ function req(name: string): string {
   return v;
 }
 
-/* Each person gets USER<N>_SECRET + USER<N>_PAT (+ optional USER<N>_NAME).
-   The secret they type on the consent page is what identifies them, so their
-   own PAT is the one injected upstream. */
-type User = { id: string; secret: string; pat: string };
-
+/* Each person gets USER<N>_SECRET + USER<N>_PAT + USER<N>_REPO
+   (+ optional USER<N>_NAME, USER<N>_BRANCH, USER<N>_ROOT).
+   The secret they type on the consent page is what identifies them, so their own
+   PAT and their own repo are the ones used. One repo per identity: no tool ever
+   takes a repo argument, which is what keeps the no-picker, no-database model. */
 const users: User[] = Object.keys(process.env)
   .map((k) => /^USER(\d+)_SECRET$/.exec(k)?.[1])
   .filter((n): n is string => !!n)
   .sort()
-  .map((n) => ({
-    id: process.env[`USER${n}_NAME`] || `user${n}`,
-    secret: process.env[`USER${n}_SECRET`]!,
-    pat: req(`USER${n}_PAT`),
-  }));
+  .map((n) => {
+    const repo = req(`USER${n}_REPO`);
+    if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) throw new Error(`USER${n}_REPO must be "owner/name" (got "${repo}")`);
+    return {
+      id: process.env[`USER${n}_NAME`] || `user${n}`,
+      secret: process.env[`USER${n}_SECRET`]!,
+      pat: req(`USER${n}_PAT`),
+      repo,
+      branch: process.env[`USER${n}_BRANCH`] || undefined,
+      root: process.env[`USER${n}_ROOT`] || undefined,
+    };
+  });
 
-if (!users.length) throw new Error("No users configured: set USER1_SECRET and USER1_PAT");
+if (!users.length) throw new Error("No users configured: set USER1_SECRET, USER1_PAT and USER1_REPO");
 if (new Set(users.map((u) => u.id)).size !== users.length) throw new Error("Duplicate USER<N>_NAME values");
+// Colliding secrets would mean one person silently committing to another person's repo.
+if (new Set(users.map((u) => u.secret)).size !== users.length) throw new Error("Duplicate USER<N>_SECRET values");
 
 /* ---------------- crypto helpers ---------------- */
 
@@ -253,45 +262,41 @@ const server = createServer(async (rq, res) => {
       return json(res, 400, { error: "unsupported_grant_type" });
     }
 
-    /* --- transparent MCP proxy --- */
+    /* --- MCP endpoint. This server terminates MCP; nothing is proxied. --- */
     if (path === "/mcp") {
       const auth = rq.headers.authorization || "";
       const claims = auth.startsWith("Bearer ") ? verify(auth.slice(7)) : null;
       const caller = claims?.typ === "access" ? users.find((u) => u.id === claims.sub) : undefined;
       if (!caller) {
+        // Only ever this server's own JWT and its own resource metadata. A GitHub 401
+        // must never surface here, or the connector re-authenticates against GitHub forever.
         return json(res, 401, { error: "invalid_token" }, {
           "WWW-Authenticate": `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource"`,
         });
       }
 
-      const headers: Record<string, string> = { Authorization: `Bearer ${caller.pat}` };
-      for (const h of ["content-type", "accept", "mcp-session-id", "mcp-protocol-version"]) {
-        const v = rq.headers[h];
-        if (typeof v === "string") headers[h] = v;
+      // Request/response only: no SSE stream to keep open, so no session to mint.
+      if (method !== "POST") return json(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
+
+      let msg: unknown;
+      try {
+        msg = JSON.parse((await body(rq)).toString() || "null");
+      } catch {
+        return json(res, 200, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
       }
 
-      const target = new URL(UPSTREAM_MCP_URL);
-      target.search = url.search;
-
-      const upstream = await fetch(target, {
-        method,
-        headers,
-        body: method === "GET" || method === "HEAD" ? undefined : new Uint8Array(await body(rq)),
-        redirect: "manual",
-      });
-
-      const out: Record<string, string> = { ...CORS };
-      for (const h of ["content-type", "mcp-session-id", "mcp-protocol-version", "cache-control", "www-authenticate"]) {
-        const v = upstream.headers.get(h);
-        if (v) out[h] = v;
+      if (Array.isArray(msg)) {
+        const out = (await Promise.all(msg.map((m) => handleMessage(caller, m)))).filter(Boolean);
+        if (!out.length) return json(res, 202, "");
+        return json(res, 200, out);
       }
-      res.writeHead(upstream.status, out);
-      res.flushHeaders();
 
-      if (!upstream.body) return res.end();
-      const stream = Readable.fromWeb(upstream.body as never);
-      stream.on("error", () => res.end());
-      return stream.pipe(res);
+      const reply = await handleMessage(caller, msg);
+      if (!reply) {
+        res.writeHead(202, CORS);
+        return res.end();
+      }
+      return json(res, 200, reply);
     }
 
     return json(res, 404, { error: "not_found" });
@@ -302,10 +307,22 @@ const server = createServer(async (rq, res) => {
   }
 });
 
-// purge expired auth codes
+// purge expired auth codes, retained failed batches, and commit-cadence timestamps
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of codes) if (v.exp < now) codes.delete(k);
+  sweep();
 }, 60_000).unref();
 
-server.listen(PORT, () => console.log(`listening on :${PORT} -> ${UPSTREAM_MCP_URL}`));
+// Log what is being dropped. Deliberately commits nothing: an auto-commit on shutdown
+// would publish work nobody approved.
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.on(sig, () => {
+    onShutdown();
+    process.exit(0);
+  });
+}
+
+server.listen(PORT, () =>
+  console.log(`listening on :${PORT} — ${users.map((u) => `${u.id}->${u.repo}`).join(", ")}`)
+);

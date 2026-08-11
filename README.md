@@ -1,89 +1,132 @@
-# mcp-github-proxy
+# md-github
 
-Transparent MCP reverse-proxy that lets a **claude.ai custom connector** reach GitHub's remote MCP
-server. Claude authenticates to *this* server with OAuth 2.1 + DCR (which the connector form
-requires); this server then forwards every MCP request verbatim to
-`https://api.githubcopilot.com/mcp/` with a GitHub PAT swapped into the `Authorization` header.
+A small MCP server that lets a **claude.ai custom connector** do surgical markdown edits in one
+GitHub repository, batching any number of changes into **exactly one commit**.
 
-No GitHub tools are reimplemented — it is pure pass-through. No database. Zero runtime dependencies.
+Claude authenticates with OAuth 2.1 + DCR (which the connector form requires). Each person's
+consent secret selects their own GitHub PAT and their own repo. Zero runtime dependencies, no
+database, all state in memory.
 
-## Endpoints
+This is **not** a GitHub MCP passthrough. It exposes three tools and nothing else.
 
-| Route | Purpose |
+## The three tools
+
+| Tool | What it does |
 | --- | --- |
-| `GET /.well-known/oauth-protected-resource[/mcp]` | Resource metadata |
-| `GET /.well-known/oauth-authorization-server[/mcp]` | AS metadata |
-| `POST /register` | Dynamic client registration (public client, no secret) |
-| `GET/POST /authorize` | Consent page → one password field → 302 with auth code |
-| `POST /token` | `authorization_code` (PKCE S256 enforced) + `refresh_token` |
-| `ALL /mcp` | Authenticated transparent proxy (POST / GET / DELETE) |
+| `list_md` | Every .md file with byte size and git blob SHA. Read-only. |
+| `read_md` | One file's exact bytes, its blob SHA, and a heading outline with line ranges. Read-only. |
+| `commit_edits` | Applies an ordered list of edits and pushes them as **one** commit. The only tool that writes. |
 
-Access tokens are HS256 JWTs (~1h), refresh tokens 30d, so tokens survive restarts. Auth codes and
-registered clients live in memory (single user); auth codes expire after 60s and are single-use.
+`commit_edits` takes four operations:
 
-Only these `redirect_uri` values are accepted:
-`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`.
+| op | Fields | Notes |
+| --- | --- | --- |
+| `write` | `path`, `content`, `mode` | `create` (default), `overwrite` (needs `expect_sha`), `append`. |
+| `str_replace` | `path`, `old_string`, `new_string`, `replace_all` | Exact byte match; must be unique unless `replace_all`. |
+| `edit_section` | `path`, `heading`, `mode`, `content` | `replace` / `append` / `prepend` / `delete` a section addressed by its heading. |
+| `delete` | `path`, `expect_sha` | Removes a file. |
+
+### Why there is no start_commit / end_commit
+
+The obvious design is a staging area you open and later close with a message. It was rejected
+deliberately: it creates a place where finished-looking work can sit unpublished, so "I made the
+edits and forgot to commit" becomes constructible. Three independent design reviews converged on
+the same conclusion.
+
+Instead there is **no staging area at all**. `commit_edits` is atomic — a whole batch of changes
+across many files, applied and pushed in one call, or nothing sent to GitHub whatsoever. The agent
+accumulates its plan in its own context (the one store a model reads reliably) and spends it in a
+single call. Every tool result ends with a standing line saying nothing is pending, so the belief
+that something is queued is refuted continuously rather than left to be discovered later.
+
+There is also **no auto-commit timer**, at any timeout. An idle timer publishes work nobody
+approved — a retracted deletion, a half-finished restructure. Zero unwanted commits is a designed
+property, not an omission. On shutdown the server logs what it is dropping and commits nothing.
+
+The one piece of retained state is **failure-only**: a batch that fails is held for 30 minutes as a
+`retry_ref` so a large batch need not be retyped from a context that may already have been
+compacted. It is announced on every subsequent result, it is cleared by any success, and it can
+never produce a success receipt.
+
+### Atomicity, precisely
+
+`commit_edits` runs two phases and the boundary is the guarantee.
+
+- **Plan** — validation, snapshot fetch, `expect_sha` checks, applying every op to in-memory
+  buffers. Any failure aborts here having issued only `GET`s. Not "rolled back": no mutative
+  request was ever sent. All failures in a batch are reported together, so a 12-op batch with 3
+  defects costs one turn rather than three.
+- **Execute** — three mutative requests (`POST /git/trees`, `POST /git/commits`,
+  `PATCH /git/refs`) regardless of how many files changed. Only the final `PATCH` is observable.
+
+So after any call there are exactly two observable states: one commit exists, or the branch is
+byte-identical to before.
+
+`expect_sha` is required exactly where an operation destroys a whole file — `delete` and
+`write mode=overwrite`. You cannot wholesale replace or remove a file you never observed.
+`list_md` returns full blob SHAs, so a deletion never needs a content read.
+
+### Concurrency
+
+Content is re-read at commit time from a single pinned snapshot, so the read-modify-write window is
+about a second rather than the length of a conversation. `PATCH ... force:false` is a real
+server-side compare-and-swap; `force: true` is never sent anywhere. On a collision the whole plan
+re-runs against the new head: if nothing the batch touches moved, it lands silently; if something
+did, it stops and returns the fresh upstream content inline rather than clobbering.
 
 ## Environment
 
 | Var | Notes |
 | --- | --- |
 | `JWT_SECRET` | Signs the tokens this server issues. |
-| `PUBLIC_URL` | This service's own base URL, no trailing slash, e.g. `https://x.up.railway.app`. |
-| `UPSTREAM_MCP_URL` | Optional, defaults to `https://api.githubcopilot.com/mcp/`. |
-| `PORT` | Provided by Railway. |
+| `PUBLIC_URL` | This service's own base URL, no trailing slash. |
+| `PORT` | Pinned to 3000 to match the generated Railway domain. |
+| `GITHUB_API_URL` | Defaults to `https://api.github.com`. The testing seam. |
 
-### Users (one numbered triple per person)
+One numbered triple per person:
 
 | Var | Notes |
 | --- | --- |
-| `USER<N>_SECRET` | What that person types on the consent page. |
-| `USER<N>_PAT` | That person's fine-grained GitHub PAT, injected upstream for their requests only. |
-| `USER<N>_NAME` | Optional label, defaults to `user<N>`. Ends up as the token `sub`. |
+| `USER<N>_SECRET` | What that person types on the consent page. Identity is the secret. |
+| `USER<N>_PAT` | That person's GitHub PAT. Used only for their own requests. |
+| `USER<N>_REPO` | `owner/name`. One repo per identity — no tool takes a repo argument. |
+| `USER<N>_NAME` | Optional label, defaults to `user<N>`. Becomes the token `sub`. |
+| `USER<N>_BRANCH` | Optional. Defaults to the repo's default branch, resolved lazily. |
+| `USER<N>_ROOT` | Optional path prefix that confines this user to a subtree. |
 
-Two people means `USER1_*` and `USER2_*`. The secret is the identity: whichever secret is typed
-decides which PAT gets injected, so there is no account picker and no user database. Everyone's
-tokens are independent — rotating one person's secret or PAT does not disturb the other.
-
-Adding a third person later is just another `USER3_*` triple; the server discovers them at boot.
-
-`JWT_SECRET`, `PUBLIC_URL`, and at least one complete user triple are required — the process exits
-at boot if any is missing.
+`USER<N>_NAME` is an identity key, not a label: renaming someone invalidates their live tokens and
+they must reconnect. Changing their `PAT` or `REPO` takes effect immediately with no reconnect,
+which makes repo migration a one-variable change.
 
 ## Connect from claude.ai
 
-1. claude.ai → **Settings → Connectors → Add custom connector**.
-2. **URL**: `<PUBLIC_URL>/mcp` — that exact path.
-3. Leave **OAuth Client ID** and **Client Secret** empty (the server registers Claude dynamically).
-4. Click **Connect**. A window opens on `/authorize`.
-5. Type **your own** secret (`USER1_SECRET` or `USER2_SECRET`), submit. The window closes and the
-   connector shows as connected.
-6. Enable the connector in a chat; GitHub's tools appear as if you had connected GitHub directly.
+1. Settings → Connectors → **Add custom connector**.
+2. **URL**: `<PUBLIC_URL>/mcp`.
+3. Leave client ID and secret empty.
+4. **Connect**, then type your own `USER<N>_SECRET`.
 
-Both people add the *same* connector URL — the secret each types is what binds their session to
-their own PAT. Same flow works on mobile. If the connector ever drops, hit **Connect** again — the
-refresh grant normally handles it silently.
+Both people add the same URL; the secret each types binds their session to their own PAT and repo.
 
-## Local run
+## Tests
 
 ```bash
 npm install && npm run build
+node test-md.mjs        # 61 assertions: scanner, edit ops, byte fidelity — no network
 
-# terminal 1 — fake upstream that echoes back which PAT arrived
-node echo-upstream.mjs
-
-# terminal 2 — the proxy, pointed at the fake upstream
-USER1_NAME=alice USER1_SECRET=secret-alice USER1_PAT=pat-alice \
-USER2_NAME=bob   USER2_SECRET=secret-bob   USER2_PAT=pat-bob \
+# integration: 87 assertions against a stateful fake GitHub
+USER1_NAME=alice USER1_SECRET=secret-alice USER1_PAT=pat-alice USER1_REPO=alice/notes \
+USER2_NAME=bob   USER2_SECRET=secret-bob   USER2_PAT=pat-bob   USER2_REPO=bob/wiki \
 JWT_SECRET=test-jwt PUBLIC_URL=http://127.0.0.1:8787 PORT=8787 \
-UPSTREAM_MCP_URL=http://127.0.0.1:8899/ npm start
-
-# terminal 3
+GITHUB_API_URL=http://127.0.0.1:8899 npm start &
 node smoke.mjs
 ```
 
-`smoke.mjs` covers discovery, DCR, the redirect allowlist, PKCE (including a deliberate mismatch),
-single-use codes, refresh, per-user PAT injection, header round-tripping, and unbuffered SSE.
+`fake-github.mjs` is a stateful fake with a real git-blob-SHA implementation, a commit DAG, a
+request log and injectable faults, so a commit made through the server is observable by a later
+read. It is what lets the suite assert the things that actually matter: that N edits produce
+exactly one commit and zero `PUT /contents` calls, that a deletion survives serialization as a
+literal `"sha":null`, that `force:false` appears on every ref update, that a failed batch leaves
+zero mutative requests, and that a colleague's concurrent push is never clobbered.
 
 ## Deploying
 
@@ -94,18 +137,22 @@ railway up --service mcp-github-proxy --detach
 Builds via the `Dockerfile`, deliberately. Railway's default builder (railpack) fails this service
 with `failed to solve: secret RAILWAY_GIT_REPO_OWNER not found` — its generated plan declares the
 `RAILWAY_GIT_*` build secrets, which only exist when the service's source is a connected GitHub
-repo, not a CLI tarball upload. Deleting the `Dockerfile` brings that failure back unless the
-service is first connected to a GitHub source.
-
-`PORT` is pinned to 3000 to match the generated domain's target port.
+repo, not a CLI tarball upload.
 
 ## Notes
 
-- Claude's token never goes upstream; no PAT ever comes back down.
-- A token's `sub` claim selects the PAT on every request, so one person's session can never reach
-  GitHub as the other. Revoke someone by deleting their `USER<N>_*` triple — their live tokens stop
-  resolving to a PAT immediately and start returning 401.
-- Responses stream unbuffered, so GitHub's `text/event-stream` replies flush as they arrive.
-- `Mcp-Session-Id` and `MCP-Protocol-Version` round-trip in both directions — required or the
-  session breaks after `initialize`.
-- Rotating `JWT_SECRET` invalidates every issued token; reconnect the connector afterwards.
+- The markdown scanner is a real CommonMark block scanner, not a `^#{1,6}` regex. Front matter's
+  closing `---` is a legal setext H2 underline, so a naive scan invents a phantom heading named
+  after the last YAML line and an agent would edit straight into the front matter. Headings inside
+  fences, indented code, HTML blocks and blockquotes are correctly not addressable.
+- Byte fidelity is deliberate: CRLF files keep CRLF on untouched lines, a BOM is split off so a
+  start-anchored `old_string` can match, and nothing is ever trimmed — two trailing spaces are a
+  markdown hard line break.
+- `read_md` returns content **without** line-number gutters, because numbers next to text the model
+  is about to copy into `old_string` is exactly how a gutter ends up in the needle. Line numbers
+  appear only in outlines and error messages — places nothing is copied from.
+- A GitHub 401 is surfaced as tool-error text and never as an HTTP 401 from `/mcp`. The old proxy
+  forwarded GitHub's `WWW-Authenticate`, which sent claude.ai to re-authenticate against GitHub and
+  produced a reauth loop while the real problem — a dead PAT — stayed invisible.
+- The PAT is the real security boundary. `USER<N>_REPO` confines this server to one repo, but a
+  token with broader access still has that access; scope the PAT itself in GitHub.
