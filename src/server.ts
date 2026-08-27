@@ -18,29 +18,25 @@ function req(name: string): string {
   return v;
 }
 
-/* Each person gets USER<N>_SECRET + USER<N>_PAT + USER<N>_REPO
-   (+ optional USER<N>_NAME, USER<N>_BRANCH, USER<N>_ROOT).
-   The secret they type on the consent page is what identifies them, so their own
-   PAT and their own repo are the ones used. One repo per identity: no tool ever
-   takes a repo argument, which is what keeps the no-picker, no-database model. */
+/* Each person needs exactly two variables: USER<N>_SECRET (what they type on the consent page)
+   and USER<N>_PAT (the token their requests are made with). USER<N>_NAME is an optional label.
+
+   There is nothing else to configure. The PAT is the whole of a person's reach — every
+   repository it can see — and every tool call names the repository it acts on, so there is no
+   default repository, no pinned repository, no branch override and no subtree confinement.
+   Narrowing belongs in the PAT's own GitHub scopes, which is the only boundary that actually
+   holds; a second one here could only ever disagree with it. */
 const users: User[] = Object.keys(process.env)
   .map((k) => /^USER(\d+)_SECRET$/.exec(k)?.[1])
   .filter((n): n is string => !!n)
   .sort()
-  .map((n) => {
-    const repo = req(`USER${n}_REPO`);
-    if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) throw new Error(`USER${n}_REPO must be "owner/name" (got "${repo}")`);
-    return {
-      id: process.env[`USER${n}_NAME`] || `user${n}`,
-      secret: process.env[`USER${n}_SECRET`]!,
-      pat: req(`USER${n}_PAT`),
-      repo,
-      branch: process.env[`USER${n}_BRANCH`] || undefined,
-      root: process.env[`USER${n}_ROOT`] || undefined,
-    };
-  });
+  .map((n) => ({
+    id: process.env[`USER${n}_NAME`] || `user${n}`,
+    secret: process.env[`USER${n}_SECRET`]!,
+    pat: req(`USER${n}_PAT`),
+  }));
 
-if (!users.length) throw new Error("No users configured: set USER1_SECRET, USER1_PAT and USER1_REPO");
+if (!users.length) throw new Error("No users configured: set USER1_SECRET and USER1_PAT");
 if (new Set(users.map((u) => u.id)).size !== users.length) throw new Error("Duplicate USER<N>_NAME values");
 // Colliding secrets would mean one person silently committing to another person's repo.
 if (new Set(users.map((u) => u.secret)).size !== users.length) throw new Error("Duplicate USER<N>_SECRET values");
@@ -333,6 +329,4 @@ for (const sig of ["SIGTERM", "SIGINT"] as const) {
   });
 }
 
-server.listen(PORT, () =>
-  console.log(`listening on :${PORT} — ${users.map((u) => `${u.id}->${u.repo}`).join(", ")}`)
-);
+server.listen(PORT, () => console.log(`listening on :${PORT} — ${users.map((u) => u.id).join(", ")}`));

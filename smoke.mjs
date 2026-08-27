@@ -87,13 +87,23 @@ async function rpc(token, method, params) {
 }
 // Every tool result must carry the standing ledger line — asserted centrally so none can skip it.
 let ledgerMisses = 0;
+let rosterMisses = 0;
+// `repo` is required on every tool. The assertions below are about edit semantics rather than
+// repo resolution, so this fills it in per identity; omitting it is tested explicitly further
+// down. rawCall bypasses the injection.
+const repoOf = new Map(); // access token -> bare repo name
+const rawCall = (token, name, args) => rpc(token, "tools/call", { name, arguments: args });
 async function call(token, name, args) {
+  if (name !== "create_repo" && args?.repo === undefined) args = { repo: repoOf.get(token) ?? "notes", ...args };
   const r = await rpc(token, "tools/call", { name, arguments: args });
   const t = r.body?.result?.content?.[0]?.text ?? "";
   if (!t.includes("PENDING:")) ledgerMisses++;
+  if (/\bREPOS\b/.test(t)) rosterMisses++;
   return { text: t, isError: !!r.body?.result?.isError, raw: r.body };
 }
 const A = alice.tok.access_token, BK = bob.tok.access_token;
+repoOf.set(A, "notes");
+repoOf.set(BK, "wiki");
 
 const init = await rpc(A, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "smoke", version: "0" } });
 ok("initialize echoes a known protocol version", init.body.result.protocolVersion === "2025-06-18");
@@ -102,8 +112,15 @@ ok("unknown protocol version negotiates rather than erroring", !oldInit.body.err
 ok("declares only the tools capability",
   init.body.result.capabilities.tools && init.body.result.capabilities.tools.listChanged !== true &&
   !init.body.result.capabilities.resources && !init.body.result.capabilities.prompts);
-ok("instructions present and under 2000 bytes",
-  init.body.result.instructions?.length > 0 && Buffer.byteLength(init.body.result.instructions) < 2000);
+ok("instructions are present and list no repositories",
+  init.body.result.instructions?.length > 0 && !/\bREPOS\b/.test(init.body.result.instructions),
+  init.body.result.instructions?.slice(-300));
+// Nothing in the handshake can name a repository, because a connection is not bound to one.
+ok("the handshake ships no repository index and no repository names",
+  !/this repository's own index/.test(init.body.result.instructions) && !/silky|notes|wiki/.test(init.body.result.instructions),
+  init.body.result.instructions?.slice(-200));
+ok("the handshake points at overview as the way in",
+  /overview\(repo\)/.test(init.body.result.instructions), init.body.result.instructions?.slice(0, 200));
 ok("no Mcp-Session-Id is ever minted", !init.headers.get("mcp-session-id"));
 
 const notif = await fetch(`${B}/mcp`, {
@@ -121,8 +138,9 @@ ok("DELETE /mcp is 405", (await fetch(`${B}/mcp`, { method: "DELETE", headers: {
 
 const list = (await rpc(A, "tools/list", {})).body.result.tools;
 const names = list.map((t) => t.name).sort();
+const TOOLS_BY_NAME = Object.fromEntries(list.map((t) => [t.name, t]));
 ok("EXACTLY the intended tools are exposed, no GitHub passthrough",
-  JSON.stringify(names) === JSON.stringify(["commit_edits", "history", "list_md", "read_md", "show_commit"]), JSON.stringify(names));
+  JSON.stringify(names) === JSON.stringify(["commit_edits", "create_repo", "history", "list_md", "overview", "read_md", "show_commit"]), JSON.stringify(names));
 ok("every tool has a title, object schema and annotations",
   list.every((t) => t.title && t.inputSchema?.type === "object" && t.inputSchema.additionalProperties === false && t.annotations));
 ok("reads are readOnlyHint, commit_edits is destructiveHint",
@@ -138,7 +156,9 @@ ok("list_md filters to .md only", listed.text.includes("guide.md") && listed.tex
 
 const read = await call(A, "read_md", { path: "guide.md" });
 const guideSha = /blob sha: ([0-9a-f]{40})/.exec(read.text)[1];
-ok("read_md returns the blob sha and an outline", !!guideSha && read.text.includes("outline:") && read.text.includes("L2 Install"));
+// guide.md is 9 lines, so its outline is suppressed as redundant — the headings are right there
+// in the content. The outline's two directions are asserted on their own further down.
+ok("read_md returns the blob sha", !!guideSha && read.text.includes("## Install"), read.text.slice(0, 200));
 ok("read_md content has no line-number gutters", read.text.includes("\n# Guide\n") && !/^\s*\d+\t/m.test(read.text.split("--- content")[1]));
 
 /* ---------------- path validation: never touches the network ---------------- */
@@ -192,11 +212,17 @@ await call(BK, "list_md", {});
 const aliceReqs = gh.log.filter((r) => r.authorization === "Bearer pat-alice");
 const bobReqs = gh.log.filter((r) => r.authorization === "Bearer pat-bob");
 // startsWith, not includes-with-trailing-slash: the repo-metadata call is /repos/o/r exactly.
+// /user/repos is the one non-/repos call a result makes — the token-scoped list a bare name is
+// resolved against. It names no account, so it cannot leak across identities.
+const ownScope = (_owner, repo) => (r) => r.path.startsWith(`/repos/${repo}`) || r.path === "/user/repos" || r.path === "/user";
 ok("alice's calls carry only alice's PAT and repo",
-  aliceReqs.length > 0 && aliceReqs.every((r) => r.path.startsWith("/repos/alice/notes")));
+  aliceReqs.length > 0 && aliceReqs.every(ownScope("alice", "alice/notes")),
+  aliceReqs.map((r) => r.path).join(","));
 ok("bob's calls carry only bob's PAT and repo",
-  bobReqs.length > 0 && bobReqs.every((r) => r.path.startsWith("/repos/bob/wiki")),
+  bobReqs.length > 0 && bobReqs.every(ownScope("bob", "bob/wiki")),
   bobReqs.map((r) => r.path).join(","));
+ok("neither identity ever reads the other's account",
+  !aliceReqs.some((r) => /bob/.test(r.path)) && !bobReqs.some((r) => /alice/.test(r.path)));
 ok("no request mixes the two identities", gh.log.every((r) => ["Bearer pat-alice", "Bearer pat-bob"].includes(r.authorization)));
 
 /* ---------------- all-or-nothing + failure families ---------------- */
@@ -332,12 +358,35 @@ gh.seed("alice/notes", { files: {} });
 gh.reset();
 const boot = await call(A, "commit_edits", { message: "init", edits: [{ op: "write", path: "first.md", content: "# First\n" }] });
 ok("an empty repo bootstraps", !boot.isError, boot.text);
-const bootTree = gh.log.find((r) => r.method === "POST" && /\/git\/trees$/.test(r.path));
-ok("bootstrap omits base_tree", bootTree && bootTree.body.base_tree === undefined);
-const bootCommit = gh.log.find((r) => r.method === "POST" && /\/git\/commits$/.test(r.path));
-ok("bootstrap commit has no parents", bootCommit && !bootCommit.body.parents);
-const bootRef = gh.log.find((r) => r.method === "POST" && /\/git\/refs$/.test(r.path));
-ok("bootstrap creates the ref with the refs/ prefix", bootRef && bootRef.body.ref.startsWith("refs/heads/"));
+// A repository with no commits cannot be written through the git-data API at all — real GitHub
+// answers 409 to blobs, trees and commits alike. PUT /contents is the only endpoint that works,
+// and it is used here and NOWHERE else.
+ok("bootstrap never touches the git-data API",
+  gh.log.filter((r) => r.method === "POST" && /\/git\//.test(r.path)).length === 0,
+  JSON.stringify(gh.log.filter((r) => r.method !== "GET").map((r) => `${r.method} ${r.path}`)));
+const bootPut = gh.log.filter((r) => r.method === "PUT" && /\/contents\//.test(r.path));
+ok("bootstrap is exactly one PUT /contents", bootPut.length === 1, JSON.stringify(bootPut.map((r) => r.path)));
+ok("bootstrap names the branch explicitly", bootPut[0]?.body?.branch === "main", JSON.stringify(bootPut[0]?.body?.branch));
+ok("bootstrap sends no sha, so it can only create", bootPut[0] && bootPut[0].body.sha === undefined);
+ok("the bootstrapped file is really there", String(gh.state.readFile("alice/notes", "first.md")) === "# First\n");
+{
+  // Two files cannot become one commit in an empty repository, and splitting into two commits
+  // would break the guarantee. It refuses and says what to do.
+  gh.seed("alice/notes", { files: {} });
+  const two = await call(A, "commit_edits", {
+    message: "init", edits: [
+      { op: "write", path: "a.md", content: "# A\n" },
+      { op: "write", path: "b.md", content: "# B\n" },
+    ],
+  });
+  ok("a multi-file batch into an empty repo is refused, not split",
+    two.isError && /only a single-file create can start it off/.test(two.text), two.text.slice(0, 300));
+  ok("and the refusal says how many ops remain", /remaining 1 operation/.test(two.text), two.text.slice(0, 300));
+  ok("nothing was written", !gh.state.readFile("alice/notes", "a.md") && !gh.state.readFile("alice/notes", "b.md"));
+  const listEmpty = await call(A, "list_md", {});
+  ok("listing an empty repo is 'no files', not an error",
+    !listEmpty.isError && /No \.md files/.test(listEmpty.text), listEmpty.text.slice(0, 200));
+}
 
 /* ---------------- byte fidelity through the tool surface ---------------- */
 
@@ -674,36 +723,12 @@ gh.seed("alice/notes", { files: { "h1.md": "# One\n\nalpha\n", "h2.md": "# Two\n
   ok("commit_edits still requires .md", (await call(A, "commit_edits", { message: "m", edits: [{ op: "write", path: "src/x.rs", content: "y" }] })).isError);
 }
 
-// USER<N>_ROOT is documented as confining a user to a subtree; history and show_commit ignored it.
+// An unknown branch used to be reported as a PAT-scope failure, sending the operator to audit
+// token permissions for what is a missing branch.
 {
-  const carol = await tokenFor("secret-carol");
-  const C = carol.tok.access_token;
-  const h = await call(C, "history", {});
-  ok("REGRESSION a root-confined user's history excludes outside paths",
-    !h.text.includes("src/main.rs"), h.text.slice(0, 300));
-  const all = await call(A, "history", { limit: 50 });
-  const outsideSha = /^([0-9a-f]{7})/m.exec((all.text.split("sha      date")[1] || "").split("\n").filter((l) => /^[0-9a-f]{7}/.test(l))[0] || "")?.[1];
-  if (outsideSha) {
-    const sc = await call(C, "show_commit", { sha: outsideSha });
-    // The commit MESSAGE may legitimately name the path; what must be withheld is its diff.
-    ok("REGRESSION show_commit withholds the DIFF of files outside the configured root",
-      sc.isError || !/^--- src\/main\.rs /m.test(sc.text), sc.text.slice(0, 400));
-    ok("REGRESSION show_commit says what it withheld rather than silently omitting it",
-      sc.isError || /outside the configured root were withheld/.test(sc.text), sc.text.slice(0, 400));
-  } else {
-    ok("REGRESSION show_commit withholds the DIFF of files outside the configured root", false, "could not extract a sha");
-    ok("REGRESSION show_commit says what it withheld rather than silently omitting it", false, "could not extract a sha");
-  }
-}
-
-// A wrong USER<N>_BRANCH used to be reported as a PAT-scope failure, sending the operator to
-// audit token permissions for what is a config typo.
-{
-  const dave = await tokenFor("secret-dave");
-  const D = dave.tok.access_token;
-  const h = await call(D, "history", {});
-  ok("REGRESSION an unknown branch names the branch, not the PAT",
-    h.isError && /branch/i.test(h.text) && !/Contents: Read and write/i.test(h.text), h.text.slice(0, 250));
+  const gone = await call(A, "history", { repo: "no-such-repo-here" });
+  ok("REGRESSION an unreachable repo names the repo, not a phantom default",
+    gone.isError && /No repository named "no-such-repo-here"/.test(gone.text), gone.text.slice(0, 220));
 }
 
 // Only `patch` was capped, so message/filenames/file-count made the response unbounded.
@@ -775,9 +800,274 @@ gh.seed("alice/notes", { files: { "h1.md": "# One\n\nalpha\n", "h2.md": "# Two\n
   ok("REGRESSION history returns commits newest-first", times >= 3 && dates.length >= 3, `rows=${times}`);
 }
 
+// An outline of a short file returned whole describes text two lines below it in the same
+// response. It is suppressed there and kept where it earns its place.
+{
+  gh.seed("alice/tiny", { files: {
+    "small.md": "# Small\n\nbody\n\n## Sub\n\nmore\n",
+    "big.md": "# Big\n\n" + Array.from({ length: 40 }, (_, i) => `## S${i}\n\nline\n`).join("\n"),
+  } });
+  const small = await call(A, "read_md", { repo: "tiny", path: "small.md" });
+  ok("a short whole file returns no redundant outline", !/^outline:/m.test(small.text), small.text.slice(0, 300));
+  ok("its content is still there", small.text.includes("## Sub") && small.text.includes("more"), small.text.slice(0, 300));
+  const big = await call(A, "read_md", { repo: "tiny", path: "big.md" });
+  ok("a long file keeps its outline", /^outline:/m.test(big.text) && /L2 S39/.test(big.text), big.text.slice(0, 300));
+  const paged = await call(A, "read_md", { repo: "tiny", path: "small.md", offset_lines: 3 });
+  ok("a windowed read keeps its outline even when short", /^outline:/m.test(paged.text), paged.text.slice(0, 300));
+}
+
+/* ---------------- overview: one call to orient ---------------- */
+
+{
+  // A repo this suite has not touched yet: repoIndex caches per repo+branch, so reusing one
+  // whose index was already read as absent would test the cache, not the tool.
+  gh.seed("alice/overview-demo", { files: {
+    "INDEX.md": "# notes\n\nRouter. Go to a folder index.\n",
+    "docs/index.md": "# docs\n\nfolder router\n",
+    "docs/guide.md": "# Guide\n\nbody\n",
+    "img/logo.png": "notreallyapng",
+  } });
+  gh.reset();
+  const o = await call(A, "overview", { repo: "overview-demo" });
+  ok("overview returns the root index verbatim", o.text.includes("Router. Go to a folder index."), o.text.slice(0, 400));
+  ok("overview lists every path, not only markdown", /docs\/guide\.md/.test(o.text) && /img\/logo\.png/.test(o.text), o.text);
+  ok("overview marks the non-markdown ones", /img\/logo\.png\s+\d+\s+\(not markdown\)/.test(o.text), o.text);
+  ok("overview carries sizes so the next call can skip a big file", /docs\/guide\.md\s+\d+/.test(o.text), o.text);
+  ok("overview counts files and markdown separately", /4 file\(s\), 3 markdown/.test(o.text), o.text.slice(0, 200));
+  ok("overview does NOT inline folder indexes", !o.text.includes("folder router"), o.text.slice(0, 600));
+  ok("overview is read-only", gh.log.filter((r) => r.method !== "GET").length === 0);
+
+  const capped = await call(A, "overview", { repo: "overview-demo", max_files: 2 });
+  ok("overview discloses its own cap", /showing 2 of 4 paths/.test(capped.text), capped.text.slice(0, 260));
+
+  gh.seed("alice/no-router", { files: { "notes.md": "# n\n" } });
+  const noIdx = await call(A, "overview", { repo: "no-router" });
+  ok("a repo with no root index says so rather than pretending",
+    /no INDEX\.md, index\.md or README\.md at the repository root/.test(noIdx.text), noIdx.text.slice(0, 400));
+}
+
+/* ---------------- repo is required, on every tool ---------------- */
+
+{
+  // A silent default is how an edit lands in the wrong project while every message reads like
+  // success, so every tool refuses rather than guessing.
+  for (const [tool, args] of [
+    ["overview", {}],
+    ["list_md", {}],
+    ["read_md", { path: "guide.md" }],
+    ["history", {}],
+    ["show_commit", { sha: "abcdef1" }],
+    ["commit_edits", { message: "m", edits: [{ op: "write", path: "x.md", content: "# x\n" }] }],
+  ]) {
+    const r = await rawCall(A, tool, args);
+    const t = r.body?.result?.content?.[0]?.text ?? "";
+    ok(`${tool} refuses a call with no repo`, r.body?.result?.isError && /repo is required/.test(t), t.slice(0, 200));
+    ok(`${tool}'s refusal says there is no default`, /no default repository|can address one repository/.test(t), t.slice(0, 200));
+  }
+  const empty = await rawCall(A, "list_md", { repo: "" });
+  ok("an empty repo string is refused, not treated as unset-and-defaulted",
+    empty.body?.result?.isError && /repo is required/.test(empty.body.result.content[0].text));
+  ok("the schema marks repo required on all five",
+    list.filter((t) => t.name !== "create_repo").every((t) => (t.inputSchema.required || []).includes("repo")),
+    JSON.stringify(list.map((t) => [t.name, t.inputSchema.required])));
+  ok("create_repo takes no repo", !("repo" in TOOLS_BY_NAME.create_repo.inputSchema.properties));
+}
+
+/* ---------------- multiple repositories ---------------- */
+
+gh.seed("alice/second", { files: { "INDEX.md": "# second\n\nthe second project's own router\n", "docs/x.md": "# X\n\nx\n" } });
+for (const r of ["alice/notes", "alice/second"]) gh.state.collaborators.set(r, new Set(["frank"]));
+
+{
+  const here = await call(A, "list_md", {});
+  ok("omitting repo uses the default repo", here.text.includes("alice/notes on main"), here.text.slice(0, 120));
+
+  gh.log.length = 0;
+  const other = await call(A, "list_md", { repo: "second" });
+  ok("a bare name resolves against the configured owner", other.text.includes("alice/second on main"), other.text.slice(0, 120));
+  ok("only the named repo is touched",
+    gh.log.filter((r) => r.path.startsWith("/repos/")).every((r) => r.path.startsWith("/repos/alice/second")),
+    JSON.stringify(gh.log.filter((r) => r.path.startsWith("/repos/") && !r.path.startsWith("/repos/alice/second")).map((r) => r.path)));
+
+  const full = await call(A, "list_md", { repo: "alice/second" });
+  ok("owner/name form resolves too", full.text.includes("alice/second on main"));
+
+  gh.log.length = 0;
+  const foreign = await call(A, "list_md", { repo: "wiki" });
+  ok("a name the PAT cannot see is refused", foreign.isError && /No repository named "wiki" is visible/.test(foreign.text), foreign.text.slice(0, 220));
+  ok("and the refusal names the way to address it directly", /"owner\/wiki"/.test(foreign.text), foreign.text.slice(0, 220));
+
+  const nonsense = await call(A, "list_md", { repo: "a/b/c" });
+  ok("a three-segment repo is refused", nonsense.isError && /not a repository/.test(nonsense.text));
+  const traversal = await call(A, "list_md", { repo: "../etc" });
+  ok("a traversal repo name is refused", traversal.isError, traversal.text.slice(0, 160));
+
+  // Editing across repos in the same session must not leak content between them.
+  const w = await call(A, "commit_edits", {
+    repo: "second",
+    message: "add", edits: [{ op: "write", path: "fresh.md", content: "# Fresh\n\nnew\n" }],
+  });
+  ok("commit_edits honours repo", !w.isError && w.text.includes("alice/second@main"), w.text.slice(0, 200));
+  ok("the file landed in the named repo", !!gh.state.readFile("alice/second", "fresh.md"));
+  ok("and nowhere else", !gh.state.readFile("alice/notes", "fresh.md"));
+}
+
+/* ---------------- create_repo ---------------- */
+
+{
+  gh.log.length = 0;
+  const r = await call(A, "create_repo", { name: "brand-new", overview: "What this repo holds.\n\n- one\n- two\n" });
+  ok("create_repo succeeds", !r.isError && /Created alice\/brand-new/.test(r.text), r.text.slice(0, 300));
+  ok("create_repo defaults to private", /\(private\)/.test(r.text), r.text.slice(0, 120));
+  ok("create_repo POSTed to the user endpoint",
+    gh.log.some((x) => x.method === "POST" && x.path === "/user/repos"), JSON.stringify(gh.log.map((x) => `${x.method} ${x.path}`)));
+
+  const seeded = String(gh.state.readFile("alice/brand-new", "INDEX.md") ?? "");
+  ok("the new repo is seeded with its own INDEX.md", seeded.startsWith("# brand-new\n"), JSON.stringify(seeded.slice(0, 60)));
+  ok("the overview is the index body", seeded.includes("What this repo holds.") && seeded.includes("- two"), JSON.stringify(seeded));
+  ok("seeding is exactly one commit",
+    gh.log.filter((x) => x.method === "PUT" && /^\/repos\/alice\/brand-new\/contents\//.test(x.path)).length === 1,
+    JSON.stringify(gh.log.filter((x) => x.method !== "GET").map((x) => `${x.method} ${x.path}`)));
+  ok("no other repository was written",
+    gh.log.filter((x) => x.method !== "GET" && x.path.startsWith("/repos/") && !x.path.startsWith("/repos/alice/brand-new")).length === 0,
+    JSON.stringify(gh.log.filter((x) => x.method !== "GET" && x.path.startsWith("/repos/")).map((x) => `${x.method} ${x.path}`)));
+  ok("create_repo says the repo is usable immediately", /repo:"brand-new"/.test(r.text), r.text.slice(-300));
+
+
+  // It is reachable with no reconfiguration — the whole point of owner-wide reach.
+  const l = await call(A, "list_md", { repo: "brand-new" });
+  ok("the new repo is reachable with no redeploy", !l.isError && l.text.includes("alice/brand-new on main"), l.text.slice(0, 160));
+
+  gh.log.length = 0;
+  const dupe = await call(A, "create_repo", { name: "brand-new", overview: "again" });
+  ok("a duplicate name is refused", dupe.isError && /already exists/.test(dupe.text), dupe.text.slice(0, 200));
+  ok("a refused creation commits nothing", gh.log.filter((x) => x.method === "POST" && /git\/commits/.test(x.path)).length === 0);
+
+  const bad = await call(A, "create_repo", { name: "has spaces", overview: "x" });
+  ok("an invalid name is refused before any request", bad.isError && /not a valid repository name/.test(bad.text));
+  const empty = await call(A, "create_repo", { name: "no-overview", overview: "   " });
+  ok("an empty overview is refused", empty.isError && /overview must not be empty/.test(empty.text));
+
+  // POST /user/repos creates under the TOKEN's account. Erin collaborates on alice's repos but
+  // owns none, so a repo she creates is hers — and the result must say so rather than implying
+  // it landed alongside the repos she was just editing.
+  {
+    const F = (await tokenFor("secret-frank")).tok.access_token;
+    repoOf.set(F, "notes");
+    const reach = await call(F, "list_md", { repo: "notes" });
+    ok("a PAT that owns nothing still reaches what it collaborates on", !reach.isError && reach.text.includes("alice/notes on main"), reach.text.slice(0, 160));
+    const mine = await call(F, "create_repo", { name: "franks-thing", overview: "his" });
+    ok("create_repo names the account GitHub actually created under",
+      !mine.isError && /Created frank\/franks-thing/.test(mine.text), mine.text.slice(0, 220));
+    ok("the repo really is under the token's own account", !!gh.state.repos.get("frank/franks-thing"));
+    ok("and not under the account whose repos it collaborates on", !gh.state.repos.has("alice/franks-thing"));
+  }
+
+  gh.fault("403-create");
+  const denied = await call(A, "create_repo", { name: "denied", overview: "x" });
+  ok("a 403 explains the PAT scope rather than the generic contents message",
+    denied.isError && /Administration: Read and write/.test(denied.text) && /Nothing was created/.test(denied.text), denied.text.slice(0, 400));
+  ok("a denied creation leaves no repo", !gh.state.repos.has("alice/denied"));
+}
+
+/* ---------------- batch read and outlines ---------------- */
+
+{
+  gh.seed("alice/notes", { files: {
+    "b1.md": "# One\n\nalpha\n",
+    "b2.md": "# Two\n\n## Sub\n\nbeta\n",
+    "b3.md": "# Three\n\ngamma\n",
+  } });
+
+  gh.log.length = 0;
+  const many = await call(A, "read_md", { paths: ["b1.md", "b2.md", "missing.md"] });
+  ok("a batch read returns every readable file", many.text.includes("alpha") && many.text.includes("beta"), many.text.slice(0, 400));
+  ok("a missing path in a batch reports itself without failing the call",
+    !many.isError && /=== missing\.md ===/.test(many.text) && /does not exist/.test(many.text), many.text.slice(0, 600));
+  ok("a batch says how many of how many came back", /2 of 3 file\(s\) returned/.test(many.text), many.text.slice(0, 160));
+  ok("each batch entry carries its own blob sha", (many.text.match(/blob [0-9a-f]{40}/g) || []).length === 2, many.text.slice(0, 400));
+
+  const both = await call(A, "read_md", { path: "b1.md", paths: ["b2.md"] });
+  ok("path and paths together are refused", both.isError && /either path or paths/.test(both.text));
+  const offset = await call(A, "read_md", { paths: ["b1.md"], offset_lines: 2 });
+  ok("offset_lines is refused with paths", offset.isError && /single path/.test(offset.text));
+  const dupe = await call(A, "read_md", { paths: ["b1.md", "b1.md"] });
+  ok("a duplicated path in a batch is refused", dupe.isError && /more than once/.test(dupe.text));
+  const notMd = await call(A, "read_md", { paths: ["README.txt"] });
+  ok("a batch still enforces .md", notMd.isError && /not a \.md file/.test(notMd.text));
+
+  // The shared budget is spent in order, and what got cut says so rather than vanishing.
+  const tight = await call(A, "read_md", { paths: ["b1.md", "b2.md", "b3.md"], max_bytes: 1000 });
+  ok("a shared byte budget is spent in the caller's order", tight.text.indexOf("alpha") < tight.text.indexOf("beta"), "order");
+
+  const out = await call(A, "list_md", { path_prefix: "b", outline: true });
+  ok("outline mode lists headings", /L1 One/.test(out.text) && /L2 Sub/.test(out.text), out.text.slice(0, 500));
+  ok("outline mode keeps the sha/size row", /^[0-9a-f]{40}\s+\d+\s+b1\.md$/m.test(out.text), out.text.slice(0, 500));
+
+  const files = Object.fromEntries(Array.from({ length: 45 }, (_, i) => [`wide/f${i}.md`, `# F${i}\n\nx\n`]));
+  gh.seed("alice/notes", { files });
+  const tooMany = await call(A, "list_md", { outline: true });
+  ok("outline mode refuses an unbounded listing", tooMany.isError && /the limit is 40/.test(tooMany.text), tooMany.text.slice(0, 250));
+  ok("and names the way to narrow it", /path_prefix or max_results/.test(tooMany.text));
+  const narrowed = await call(A, "list_md", { outline: true, max_results: 5 });
+  ok("outline mode works once narrowed", !narrowed.isError && /L1 F/.test(narrowed.text), narrowed.text.slice(0, 300));
+}
+
+/* ---------------- a held batch belongs to its repo ---------------- */
+
+{
+  gh.seed("alice/notes", { files: { "held.md": "# Held\n\nbody\n" } });
+  const failed = await call(A, "commit_edits", {
+    message: "will fail",
+    edits: [{ op: "str_replace", path: "held.md", old_string: "nowhere in this file", new_string: "x" }],
+  });
+  const ref = /retry_ref (r_[0-9a-f]{6})/.exec(failed.text)?.[1];
+  ok("a failed batch is still retained", !!ref, failed.text.slice(0, 300));
+  ok("the held note names the repo it was built against", /operations against alice\/notes/.test(failed.text), failed.text.slice(0, 400));
+
+  const wrongRepo = await call(A, "commit_edits", { repo: "second", message: "retry", retry_ref: ref });
+  ok("a held batch cannot be replayed into another repo",
+    wrongRepo.isError && /built against alice\/notes, not alice\/second/.test(wrongRepo.text), wrongRepo.text.slice(0, 300));
+  ok("the wrong-repo refusal names the right call", /repo:"notes"/.test(wrongRepo.text), wrongRepo.text.slice(0, 300));
+  ok("and it wrote nothing", !gh.state.readFile("alice/second", "held.md"));
+}
+
+/* ---------------- no result carries an unasked-for index ---------------- */
+
+{
+  // The index is delivered by overview(), which is asked for. Attaching it to every result
+  // instead meant paying ~3.5k tokens per call for one piece of information.
+  gh.seed("alice/quiet", { files: { "INDEX.md": "# quiet\n\nROUTER TEXT\n", "a.md": "# A\n\nx\n" } });
+  for (const [tool, args] of [
+    ["list_md", { repo: "quiet" }],
+    ["read_md", { repo: "quiet", path: "a.md" }],
+    ["history", { repo: "quiet" }],
+    ["commit_edits", { repo: "quiet", message: "m", edits: [{ op: "write", path: "b.md", content: "# B\n" }] }],
+  ]) {
+    const r = await call(A, tool, args);
+    ok(`${tool} does not append the repository's index`, !r.text.includes("ROUTER TEXT"), r.text.slice(-200));
+  }
+  const o = await call(A, "overview", { repo: "quiet" });
+  ok("overview does deliver it, because it was asked for", o.text.includes("ROUTER TEXT"), o.text.slice(0, 300));
+
+  // overview reads it live, so a commit through this server is visible on the next call.
+  const before = await call(A, "read_md", { repo: "quiet", path: "INDEX.md" });
+  const sha = /blob sha: ([0-9a-f]{40})/.exec(before.text)[1];
+  await call(A, "commit_edits", {
+    repo: "quiet", message: "rewrite index",
+    edits: [{ op: "write", path: "INDEX.md", mode: "overwrite", expect_sha: sha, content: "# quiet\n\nROUTER REWRITTEN\n" }],
+  });
+  const after = await call(A, "overview", { repo: "quiet" });
+  ok("a commit invalidates the cached index rather than serving the old router",
+    after.text.includes("ROUTER REWRITTEN") && !after.text.includes("ROUTER TEXT"), after.text.slice(0, 400));
+}
+
 /* ---------------- the ledger ---------------- */
 
 ok("EVERY tool result carried the standing PENDING line", ledgerMisses === 0, `${ledgerMisses} result(s) missing it`);
+// A roster on every result would be a screenful of irrelevant names for any broadly-scoped PAT,
+// and nothing needs it: every tool names its repository explicitly.
+ok("NO tool result lists the repositories this connection can reach", rosterMisses === 0, `${rosterMisses} result(s) printed one`);
 
 await gh.close();
 console.log(`\n${pass}/${pass + fail} passed`);

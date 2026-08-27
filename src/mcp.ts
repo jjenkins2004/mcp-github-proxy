@@ -2,7 +2,28 @@
    No GitHub tool is proxied. This server terminates MCP itself. */
 
 import { randomBytes } from "node:crypto";
-import { Edit, ToolError, User, commitEdits, history, listMd, readMd, showCommit, validatePath, validateReadPath } from "./github.js";
+import {
+  Ctx,
+  Edit,
+  OUTLINE_MAX_FILES,
+  REPO_NAME_RE,
+  ToolError,
+  User,
+  commitEdits,
+  createRepo,
+  history,
+  listMd,
+  outlinesFor,
+  overview,
+  readMany,
+  readMd,
+  repoIndex,
+  resolveRepo,
+  showCommit,
+  sweepCaches,
+  validatePath,
+  validateReadPath,
+} from "./github.js";
 import { EditError } from "./md.js";
 
 const KNOWN_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
@@ -16,13 +37,14 @@ const PENDING_LINE =
 /** Failure-only retention. Written ONLY from an isError result; it can never produce a
     success receipt. If this ever grows a "stage for later" entry point, the safety story
     of the whole design is gone. */
-type FailedBatch = { ref: string; message: string; edits: Edit[]; failedAt: number; reason: string };
+type FailedBatch = { ref: string; repo: string; message: string; edits: Edit[]; failedAt: number; reason: string };
 const lastFailure = new Map<string, FailedBatch>();
 const commitTimes = new Map<string, number[]>();
 const RETENTION_MS = 30 * 60_000;
 
 export function sweep(): void {
   const now = Date.now();
+  sweepCaches(now);
   for (const [k, v] of lastFailure) if (now - v.failedAt > RETENTION_MS) lastFailure.delete(k);
   for (const [k, v] of commitTimes) {
     const keep = v.filter((t) => now - t < 10 * 60_000);
@@ -46,8 +68,9 @@ function ledger(sub: string): string {
     const left = Math.max(1, Math.round((RETENTION_MS - age) / 60_000));
     out +=
       `\nNOTE: a batch you sent ${mins} ago failed and is held as retry_ref ${held.ref} ` +
-      `(${held.edits.length} operations, "${held.message}" — ${held.reason}). ` +
-      `Resend it with commit_edits({message, retry_ref:"${held.ref}"}). It expires in ${left}m and lives in server memory only; a restart drops it.`;
+      `(${held.edits.length} operations against ${held.repo}, "${held.message}" — ${held.reason}). ` +
+      `Resend it with commit_edits({repo:"${held.repo.split("/")[1]}", message, retry_ref:"${held.ref}"}). ` +
+      `It expires in ${left}m and lives in server memory only; a restart drops it.`;
   }
   return out;
 }
@@ -104,19 +127,54 @@ const EDIT_ITEM_SCHEMA = {
   additionalProperties: false,
 };
 
+const REPO_PROP = {
+  type: "string",
+  description:
+    'Which repository to act on — the bare name ("notes") or "owner/name". Required: there is no default repository. ' +
+    "A bare name is resolved against the repositories this connection's token can see.",
+};
+
 export const TOOLS = [
+  {
+    name: "overview",
+    title: "Repository overview",
+    description:
+      "Orient yourself in a repository in ONE call: its root INDEX.md verbatim, plus every file path with its size. Read-only. " +
+      "Call this first when you start work in a repository — it replaces a list_md plus a read_md of the index, and the index is " +
+      "the router that says which file answers which question. Folder-level index files are listed but not inlined; read the ones " +
+      "the router points you at with read_md({paths:[...]}).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: REPO_PROP,
+        max_files: { type: "integer", minimum: 1, maximum: 2000, description: "Cap on paths listed. Default 1000." },
+      },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Repository overview", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
   {
     name: "list_md",
     title: "List markdown files",
     description:
-      "List every .md file in the connected repository, with byte size and git blob SHA. Read-only. " +
-      "The blob SHA shown is exactly what that file's expect_sha takes in commit_edits, so a file can be deleted straight from this listing with no content read.",
+      "List every .md file in a repository, with byte size and git blob SHA. Read-only. " +
+      "The blob SHA shown is exactly what that file's expect_sha takes in commit_edits, so a file can be deleted straight from this listing with no content read. " +
+      "Pass outline:true on a narrowed listing to see each file's headings without reading it.",
     inputSchema: {
       type: "object",
       properties: {
+        repo: REPO_PROP,
         path_prefix: { type: "string", description: 'Repo-relative directory prefix to filter by, e.g. "docs/". Empty lists the whole repository.' },
         max_results: { type: "integer", minimum: 1, maximum: 2000, description: "Maximum files to list. Default 500." },
+        outline: {
+          type: "boolean",
+          description:
+            `Also return each file's heading outline. Costs one read per file, so it is refused above ${OUTLINE_MAX_FILES} files — ` +
+            "narrow with path_prefix or max_results first. Default false.",
+        },
       },
+      required: ["repo"],
       additionalProperties: false,
     },
     annotations: { title: "List markdown files", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -125,16 +183,27 @@ export const TOOLS = [
     name: "read_md",
     title: "Read markdown file",
     description:
-      "Return the exact text of one .md file, its git blob SHA, and an outline of its headings with line ranges. Read-only. " +
+      "Return the exact text of one or several .md files, each with its git blob SHA and an outline of its headings with line " +
+      "ranges. Read-only. Prefer paths:[...] over several calls — reading five folder indexes costs one round trip instead of five. " +
       "Content comes back without line-number gutters, so any span copied out of it matches the file byte for byte and can be pasted straight into old_string.",
     inputSchema: {
       type: "object",
       properties: {
+        repo: REPO_PROP,
         path: { type: "string", description: 'Repo-relative path to a .md file, e.g. "docs/guide.md". No leading slash.' },
-        offset_lines: { type: "integer", minimum: 1, description: "1-based line to start the returned window at. Default 1." },
-        max_bytes: { type: "integer", minimum: 1000, maximum: 120000, description: "Byte cap on the returned window. Default 100000." },
+        paths: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: { type: "string" },
+          description:
+            "Read several files in one call. Supply INSTEAD of path, never alongside it. max_bytes is then a budget shared across " +
+            "the whole batch, spent in this order. A path that does not exist reports its own error and the others still return.",
+        },
+        offset_lines: { type: "integer", minimum: 1, description: "1-based line to start the returned window at. Default 1. Single path only." },
+        max_bytes: { type: "integer", minimum: 1000, maximum: 120000, description: "Byte cap on the returned window, or on the whole batch. Default 100000." },
       },
-      required: ["path"],
+      required: ["repo"],
       additionalProperties: false,
     },
     annotations: { title: "Read markdown file", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -149,6 +218,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        repo: REPO_PROP,
         path: {
           type: "string",
           description:
@@ -157,6 +227,7 @@ export const TOOLS = [
         },
         limit: { type: "integer", minimum: 1, maximum: 100, description: "How many commits to return. Default 20." },
       },
+      required: ["repo"],
       additionalProperties: false,
     },
     annotations: { title: "Commit history", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -168,8 +239,11 @@ export const TOOLS = [
       "Show one commit: its author, date, full message, and the diff of every file it changed. Read-only. Take the sha from history().",
     inputSchema: {
       type: "object",
-      properties: { sha: { type: "string", description: "The commit SHA, full or abbreviated (at least 7 hex characters)." } },
-      required: ["sha"],
+      properties: {
+        repo: REPO_PROP,
+        sha: { type: "string", description: "The commit SHA, full or abbreviated (at least 7 hex characters)." },
+      },
+      required: ["repo", "sha"],
       additionalProperties: false,
     },
     annotations: { title: "Show a commit diff", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -178,7 +252,7 @@ export const TOOLS = [
     name: "commit_edits",
     title: "Commit markdown edits",
     description:
-      "Apply an ordered list of markdown edits and push them as EXACTLY ONE commit. This is the only tool that writes. " +
+      "Apply an ordered list of markdown edits and push them as EXACTLY ONE commit. This is the only tool that edits markdown. " +
       "Either every operation succeeds and one commit is created, or nothing is sent to GitHub at all — this server holds no staging area, " +
       "and a file is unchanged until this call returns a commit SHA. Batch as much as you can into a single call: several files and " +
       "several operations per file land in one commit. Operations apply in array order against one working copy per path, so a later " +
@@ -186,6 +260,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        repo: REPO_PROP,
         message: { type: "string", minLength: 1, maxLength: 2000, description: "The commit message." },
         edits: { type: "array", minItems: 1, maxItems: 100, items: EDIT_ITEM_SCHEMA, description: "Operations applied in array order." },
         retry_ref: {
@@ -193,19 +268,53 @@ export const TOOLS = [
           description: "Resend a batch this server retained after a failed commit_edits. Supply INSTEAD of edits, never alongside it.",
         },
       },
-      required: ["message"],
+      required: ["repo", "message"],
       additionalProperties: false,
     },
     annotations: { title: "Commit markdown edits", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
+  {
+    name: "create_repo",
+    title: "Create a repository",
+    description:
+      "Create a new repository under the account this connection's token belongs to, and seed it with its own INDEX.md carrying " +
+      "the overview you give. The result names the repository GitHub actually created. " +
+      "Every repository is self-describing: there is no global registry file, so the overview belongs in the new repo's own index. " +
+      "The repository is reachable immediately — pass repo:\"<name>\" to the other tools, with no reconfiguration. " +
+      "This makes two separate changes on GitHub (the repository, then its first commit) and reports them separately, because they " +
+      "cannot be one transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: 'The repository name, without the owner. Letters, digits, ".", "-" and "_".' },
+        overview: {
+          type: "string",
+          description:
+            "What this repository is for, in markdown. Becomes the body of its INDEX.md under an H1 of the repo name, so write it " +
+            "as the document a reader lands on first — what lives here and where to go next — not as a one-line summary.",
+        },
+        description: { type: "string", description: "GitHub's own repo description field, shown on the repo page. Defaults to the overview's first line. Capped at 350 characters." },
+        private: { type: "boolean", description: "Default true. Pass false only for a repository that should be world-readable." },
+      },
+      required: ["name", "overview"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Create a repository", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
 ];
 
 const INSTRUCTIONS =
-  "Markdown editing for one GitHub repository. Read with list_md and read_md; change anything with commit_edits, which is the only " +
-  "tool that writes and always produces exactly one commit. There is no staging area and nothing is ever queued: an edit exists only " +
-  "once commit_edits returns a commit SHA. Prefer one commit_edits call carrying every change you intend, rather than one call per file. " +
+  "Markdown editing for GitHub repositories. Start work in a repository by calling overview(repo) — it returns that repository's " +
+  "own INDEX.md router plus every file path, which is what tells you where anything is. Then read with read_md and list_md; change " +
+  "markdown with commit_edits, which always produces exactly one commit; make a new repository with create_repo. " +
+  "There is no staging area and nothing is ever " +
+  "queued: an edit exists only once commit_edits returns a commit SHA. Prefer one commit_edits call carrying every change you intend, " +
+  "rather than one call per file, and prefer read_md({paths:[...]}) over one call per file. " +
   "For surgical changes use str_replace (exact text) or edit_section (addressed by heading) rather than rewriting a whole file. " +
-  "expect_sha is required wherever an operation destroys a whole file — delete, and write with mode=overwrite.";
+  "expect_sha is required wherever an operation destroys a whole file — delete, and write with mode=overwrite. " +
+  "Every tool except create_repo REQUIRES a repo argument and there is no default repository, so name the one you were asked to " +
+  "work in. Each repository documents itself in its own root INDEX.md — there is no cross-repository index — so when you create or " +
+  "restructure one, that file is what you keep current.";
 
 /* ---------------- helpers ---------------- */
 
@@ -299,45 +408,117 @@ function coerceEdit(raw: unknown, i: number): Edit {
 /* ---------------- tool execution ---------------- */
 
 async function callTool(user: User, name: string, args: Record<string, unknown>) {
+  // create_repo is the one tool that does not act on an existing repository, so it is the one
+  // tool that does not take a repo argument.
+  if (name === "create_repo") return createRepoTool(user, args);
+
+  const ctx = await resolveRepo(user, args.repo);
+
+  if (name === "overview") {
+    const max = typeof args.max_files === "number" ? Math.min(2000, Math.max(1, Math.floor(args.max_files))) : 1000;
+    const r = await overview(ctx, max);
+    const kb = (n: number) => (n < 1024 ? `${n} B` : `${Math.round(n / 1024)} KB`);
+    let out = `${ctx.repo} on ${r.branch} — ${r.total} file(s), ${r.markdown} markdown, ${kb(r.bytes)} total`;
+    if (r.truncated) out += ` (GitHub truncated the tree; some paths are missing)`;
+    if (r.files.length < r.total) out += `\nshowing ${r.files.length} of ${r.total} paths — raise max_files for the rest`;
+
+    out += r.index
+      ? `\n\n--- ${r.index.path} ---\n${r.index.text}`
+      : `\n\n(no INDEX.md, index.md or README.md at the repository root — there is no router, so the file list below is all the structure there is)`;
+
+    // Sizes are here so the next call can avoid a 124 KB file it did not need. The widest path
+    // sets the column, so the numbers stay readable rather than ragged.
+    const w = Math.max(4, ...r.files.map((f) => f.path.length));
+    out += `\n\n--- every file ---\n${r.files.map((f) => `${f.path.padEnd(w)}  ${String(f.size).padStart(7)}${f.md ? "" : "  (not markdown)"}`).join("\n")}`;
+    return text(capResult(out) + ledger(user.id));
+  }
+
   if (name === "list_md") {
     const prefix = args.path_prefix === undefined ? "" : str(args.path_prefix, "path_prefix");
     const max = typeof args.max_results === "number" ? Math.min(2000, Math.max(1, args.max_results)) : 500;
-    const r = await listMd(user, prefix, max);
+    const r = await listMd(ctx, prefix, max);
     if (!r.files.length) {
-      return text(`No .md files${prefix ? ` under "${prefix}"` : ""} in ${user.repo} on ${r.branch}.${ledger(user.id)}`);
+      return text(`No .md files${prefix ? ` under "${prefix}"` : ""} in ${ctx.repo} on ${r.branch}.` + ledger(user.id));
     }
-    const rows = r.files.map((f) => `${f.sha}  ${String(f.size ?? 0).padStart(7)}  ${f.path}`).join("\n");
-    let head = `${user.repo} on ${r.branch} — ${r.total} markdown file(s)`;
+
+    let outlines: Map<string, string[] | null> | null = null;
+    if (args.outline === true) {
+      if (r.files.length > OUTLINE_MAX_FILES) {
+        throw new ToolError(
+          `outline:true would read ${r.files.length} files; the limit is ${OUTLINE_MAX_FILES}. ` +
+            `Narrow with path_prefix or max_results, or drop outline and read the ones you want with read_md({paths:[...]}).`
+        );
+      }
+      outlines = await outlinesFor(ctx, r.files);
+    }
+
+    const rows = r.files
+      .map((f) => {
+        const row = `${f.sha}  ${String(f.size ?? 0).padStart(7)}  ${f.path}`;
+        if (!outlines) return row;
+        const o = outlines.get(f.path);
+        if (o === null || o === undefined) return `${row}\n    (outline unavailable — too large or unreadable)`;
+        return o.length ? `${row}\n${o.map((l) => "  " + l).join("\n")}` : `${row}\n    (no headings)`;
+      })
+      .join("\n");
+    let head = `${ctx.repo} on ${r.branch} — ${r.total} markdown file(s)`;
     if (r.files.length < r.total) head += `, showing ${r.files.length}`;
     if (r.truncated) head += ` (GitHub truncated the tree; narrow with path_prefix for a complete list)`;
-    return text(`${head}\n\nblob sha                                    bytes  path\n${rows}${ledger(user.id)}`);
+    return text(capResult(`${head}\n\nblob sha                                    bytes  path\n${rows}`) + ledger(user.id));
   }
 
   if (name === "read_md") {
-    const path = validatePath(user, args.path);
-    const offset = typeof args.offset_lines === "number" ? Math.max(1, args.offset_lines) : 1;
     const maxBytes = typeof args.max_bytes === "number" ? Math.min(120000, Math.max(1000, args.max_bytes)) : 100000;
-    const r = await readMd(user, path, offset, maxBytes);
-    let out = `${path} on ${r.branch}\nblob sha: ${r.sha}\nlines: ${r.totalLines}`;
-    if (r.unclosedFence !== null) out += `\nwarning: an unclosed code fence opens at line ${r.unclosedFence + 1}; headings after it are not addressable by edit_section`;
-    if (r.outline.length) out += `\n\noutline:\n${r.outline.join("\n")}`;
-    out += `\n\n--- content (from line ${r.startLine}) ---\n${r.content}`;
-    if (r.clipped) out += `\n--- truncated at max_bytes; continue with offset_lines ---`;
-    return text(out + ledger(user.id));
+    const many = args.paths !== undefined;
+    if (many && args.path !== undefined) throw new ToolError("Supply either path or paths, not both.");
+
+    if (!many) {
+      const path = validatePath(args.path);
+      const offset = typeof args.offset_lines === "number" ? Math.max(1, args.offset_lines) : 1;
+      const r = await readMd(ctx, path, offset, maxBytes);
+      let out = `${ctx.repo}/${path} on ${r.branch}\nblob sha: ${r.sha}\nlines: ${r.totalLines}`;
+      if (r.unclosedFence !== null) out += `\nwarning: an unclosed code fence opens at line ${r.unclosedFence + 1}; headings after it are not addressable by edit_section`;
+      if (r.outline.length) out += `\n\noutline:\n${r.outline.join("\n")}`;
+      out += `\n\n--- content (from line ${r.startLine}) ---\n${r.content}`;
+      if (r.clipped) out += `\n--- truncated at max_bytes; continue with offset_lines ---`;
+      return text(out + ledger(user.id));
+    }
+
+    if (!Array.isArray(args.paths) || !args.paths.length) throw new ToolError("paths must be a non-empty array of repo-relative .md paths.");
+    if (args.paths.length > 20) throw new ToolError(`paths has ${args.paths.length} entries; the maximum is 20.`);
+    if (args.offset_lines !== undefined) throw new ToolError("offset_lines applies to a single path. Read that one file on its own to page through it.");
+    const paths = args.paths.map((p) => validatePath(p));
+    const dupes = paths.filter((p, i) => paths.indexOf(p) !== i);
+    if (dupes.length) throw new ToolError(`paths lists ${dupes[0]} more than once.`);
+
+    const r = await readMany(ctx, paths, maxBytes);
+    const parts = r.results.map((f) => {
+      if (!f.ok) return `=== ${f.path} ===\nerror: ${f.error}`;
+      let out = `=== ${f.path} (blob ${f.sha}, ${f.win.totalLines} lines) ===`;
+      if (f.win.unclosedFence !== null) out += `\nwarning: an unclosed code fence opens at line ${f.win.unclosedFence + 1}; headings after it are not addressable by edit_section`;
+      if (f.win.outline.length) out += `\noutline:\n${f.win.outline.join("\n")}`;
+      out += `\n\n--- content ---\n${f.win.content}`;
+      if (f.win.clipped) out += `\n--- truncated; read this file on its own for the rest ---`;
+      return out;
+    });
+    const failed = r.results.filter((f) => !f.ok).length;
+    let head = `${ctx.repo} on ${r.branch} — ${r.results.length - failed} of ${r.results.length} file(s) returned`;
+    if (failed) head += `; ${failed} could not be read (each says why below)`;
+    return text(capResult(`${head}\n\n${parts.join("\n\n")}`) + ledger(user.id));
   }
 
   if (name === "history") {
     // Deliberately NOT validatePath: history is read-only, and directory or non-markdown
     // filters are exactly what "who changed what" questions are made of.
-    const path = args.path === undefined ? undefined : validateReadPath(user, args.path);
+    const path = args.path === undefined ? undefined : validateReadPath(args.path);
     const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.min(100, Math.max(1, Math.floor(args.limit))) : 20;
-    const r = await history(user, path, limit);
-    if (!r.commits.length) return text(`No commits${path ? ` touching ${path}` : ""} on ${r.branch}.${ledger(user.id)}`);
+    const r = await history(ctx, path, limit);
+    if (!r.commits.length) return text(`No commits${path ? ` touching ${path}` : ""} on ${r.branch} in ${ctx.repo}.` + ledger(user.id));
     const rows = r.commits
       .map((c) => `${c.sha.slice(0, 7)}  ${(c.date || "").slice(0, 10)}  ${clip(c.author, 20).padEnd(20)}  ${clip(c.message, 100)}`)
       .join("\n");
     let out =
-      `${user.repo} on ${r.branch}${path ? ` — commits touching ${path}` : ""} (${r.commits.length}, newest first)\n\n` +
+      `${ctx.repo} on ${r.branch}${path ? ` — commits touching ${path}` : ""} (${r.commits.length}, newest first)\n\n` +
       `sha      date        author                message\n${rows}\n\n` +
       `Use show_commit with a sha to see the diff.`;
     if (path) out += `\nNote: this follows the path as it is named now; commits from before a rename are listed under the old path.`;
@@ -345,8 +526,8 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
   }
 
   if (name === "show_commit") {
-    const c = await showCommit(user, str(args.sha, "sha"));
-    let out = `commit ${c.sha}\nauthor: ${c.author}${c.email ? ` <${c.email}>` : ""}\ndate:   ${c.date}\n\n${c.message}`;
+    const c = await showCommit(ctx, str(args.sha, "sha"));
+    let out = `commit ${c.sha} in ${ctx.repo}\nauthor: ${c.author}${c.email ? ` <${c.email}>` : ""}\ndate:   ${c.date}\n\n${c.message}`;
     if (c.messageClipped) out += `\n… message truncated`;
     out += "\n";
     if (!c.files.length) out += `\n(no file changes visible in this commit)`;
@@ -364,7 +545,6 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
     const notes: string[] = [];
     if (c.filesShown < c.filesTotal) notes.push(`showing ${c.filesShown} of ${c.filesTotal} changed files`);
     if (c.pagedByGitHub) notes.push(`GitHub returned only the first ${c.files.length ? 300 : 0} files of this commit${c.totalChanges ? ` (${c.totalChanges} total line changes)` : ""}`);
-    if (c.withheldByRoot) notes.push(`${c.withheldByRoot} file(s) outside the configured root were withheld`);
     if (notes.length) out += `\n${notes.map((n) => `note: ${n}`).join("\n")}`;
     return text(capResult(out) + ledger(user.id));
   }
@@ -384,6 +564,14 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
       if (!held || held.ref !== args.retry_ref) {
         throw new ToolError(`No retained batch matches retry_ref "${String(args.retry_ref)}" — it may have expired, already succeeded, or been dropped by a restart.`);
       }
+      // A batch was authored against one repository's content. Replaying it into another would
+      // apply edits built from text that repo has never contained.
+      if (held.repo !== ctx.repo) {
+        throw new ToolError(
+          `retry_ref ${held.ref} holds a batch built against ${held.repo}, not ${ctx.repo}. ` +
+            `Resend it with repo:"${held.repo.split("/")[1]}", or rebuild the edits against ${ctx.repo}.`
+        );
+      }
       edits = held.edits;
     } else {
       if (!hasEdits || !(args.edits as unknown[]).length) throw new ToolError("edits must be a non-empty array (or supply retry_ref).");
@@ -393,28 +581,31 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
       edits = (args.edits as unknown[]).map(coerceEdit);
     }
 
-    for (const e of edits) validatePath(user, e.path);
+    for (const e of edits) validatePath(e.path);
 
     let result;
     try {
-      result = await commitEdits(user, message, edits);
+      result = await commitEdits(ctx, message, edits);
     } catch (err) {
       if (!(err instanceof ToolError || err instanceof EditError)) throw err;
       const reason = err.message;
       // Retention exists so a large batch need not be retyped. A batch that can never succeed
       // as-sent gets no ref: offering to resend it would only produce the same failure.
-      if (/No effective changes/i.test(reason)) return toolError(`${reason}${ledger(user.id)}`);
+      if (/No effective changes/i.test(reason)) return toolError(reason + ledger(user.id));
       const ref = `r_${randomBytes(3).toString("hex")}`;
-      lastFailure.set(user.id, { ref, message, edits, failedAt: Date.now(), reason: reason.split("\n")[0]!.slice(0, 160) });
-      return toolError(`${reason}\n\nThis batch is held as retry_ref ${ref} — resend it unchanged with commit_edits({message, retry_ref:"${ref}"}) once the cause is fixed.${ledger(user.id)}`);
+      lastFailure.set(user.id, { ref, repo: ctx.repo, message, edits, failedAt: Date.now(), reason: reason.split("\n")[0]!.slice(0, 160) });
+      return toolError(`${reason}\n\nThis batch is held as retry_ref ${ref} — resend it unchanged with commit_edits({message, retry_ref:"${ref}"}) once the cause is fixed.` + ledger(user.id));
     }
 
     lastFailure.delete(user.id);
-    const times = (commitTimes.get(user.id) || []).filter((t) => Date.now() - t < 10 * 60_000);
+    // Keyed by repo as well as person: working across two repositories is not the same as
+    // dribbling one-file commits into one, and should not be nudged as if it were.
+    const key = `${user.id}|${ctx.repo}`;
+    const times = (commitTimes.get(key) || []).filter((t) => Date.now() - t < 10 * 60_000);
     times.push(Date.now());
-    commitTimes.set(user.id, times);
+    commitTimes.set(key, times);
 
-    let out = `Committed ${result.sha.slice(0, 7)} to ${user.repo}@${result.branch}\n${result.url}`;
+    let out = `Committed ${result.sha.slice(0, 7)} to ${ctx.repo}@${result.branch}\n${result.url}`;
     if (result.changed.length) out += `\n\nchanged (${result.changed.length}): ${result.changed.join(", ")}`;
     if (result.deleted.length) out += `\ndeleted (${result.deleted.length}): ${result.deleted.join(", ")}`;
     if (result.notes.length) out += `\n\n${result.notes.map((n) => `• ${n}`).join("\n")}`;
@@ -433,6 +624,42 @@ async function callTool(user: User, name: string, args: Record<string, unknown>)
   return null; // unknown tool -> caller emits a protocol error
 }
 
+async function createRepoTool(user: User, args: Record<string, unknown>) {
+  const name = str(args.name, "name");
+  if (!REPO_NAME_RE.test(name) || name.length > 100) {
+    throw new ToolError(`"${name}" is not a valid repository name. Use letters, digits, ".", "-" and "_", starting with a letter or digit, up to 100 characters.`);
+  }
+  const overview = str(args.overview, "overview");
+  if (!overview.trim()) throw new ToolError("overview must not be empty — it becomes the body of the new repository's INDEX.md.");
+  if (overview.length > 20000) throw new ToolError(`overview is ${overview.length} characters; the maximum is 20000.`);
+  const description = args.description === undefined ? overview.split("\n").find((l) => l.trim()) || name : str(args.description, "description");
+  const isPrivate = args.private === undefined ? true : args.private === true;
+
+  // No repo exists yet, so this Ctx exists only to carry the PAT.
+  const ctx: Ctx = { id: user.id, pat: user.pat, repo: "(new repository)" };
+  const r = await createRepo(ctx, name, overview, description, isPrivate);
+  // The account is GitHub's answer, not a configured guess: a token that collaborates on someone
+  // else's repos still creates new ones in its OWN account, and saying which is the point.
+  let out = `Created ${r.repo} (${r.private ? "private" : "public"})\n${r.url}`;
+  if (r.seeded) {
+    out +=
+      `\n\nSeeded ${r.seeded.path} on ${r.branch} in commit ${r.seeded.sha.slice(0, 7)}\n${r.seeded.url}\n\n` +
+      `Reachable now: pass repo:"${name}" to list_md, read_md, history, show_commit and commit_edits. No reconfiguration is needed.`;
+  } else {
+    out +=
+      `\n\nThe repository exists but is EMPTY: its INDEX.md could not be written.\n${r.seedError}\n\n` +
+      `Nothing else was changed and the repository was not deleted. Finish it with a single call:\n` +
+      `commit_edits({repo:"${name}", message:"Add INDEX.md", edits:[{op:"write", path:"INDEX.md", content:"# ${name}\\n\\n…"}]})`;
+  }
+  return text(out + ledger(user.id));
+}
+
+/** The default repository's own index, delivered in the handshake. This is the whole of the
+    cold-start fix: it lands before the model's first tool call, so orientation costs zero round
+    trips instead of a list_md plus a read_md.
+
+    Best-effort by construction. A slow or rate-limited GitHub must never fail `initialize` —
+    that would brick the connector entirely rather than merely leaving it uninformed. */
 /* ---------------- JSON-RPC ---------------- */
 
 const rpcError = (id: unknown, code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
@@ -461,7 +688,9 @@ export async function handleMessage(user: User, msg: any): Promise<object | null
     return rpcOk(id, {
       protocolVersion: version,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: "md-github", version: "2.0.0" },
+      serverInfo: { name: "md-github", version: "3.0.0" },
+      // Static, and deliberately so: nothing here can name a repository, because a connection is
+      // not bound to one. overview(repo) is what delivers a repository's own router, when asked.
       instructions: INSTRUCTIONS,
     });
   }
@@ -481,9 +710,10 @@ export async function handleMessage(user: User, msg: any): Promise<object | null
       return rpcOk(id, r);
     } catch (err) {
       // SEP-1303: everything the model could fix is a TOOL error, not a protocol error.
+      // The repo argument may itself be what failed, so the footer is built without a ctx.
       if (err instanceof ToolError || err instanceof EditError) return rpcOk(id, toolError(err.message + ledger(user.id)));
       console.error("tools/call failed:", err);
-      return rpcOk(id, toolError(`The server hit an unexpected error: ${err instanceof Error ? err.message : String(err)}${ledger(user.id)}`));
+      return rpcOk(id, toolError(`The server hit an unexpected error: ${err instanceof Error ? err.message : String(err)}` + ledger(user.id)));
     }
   }
 

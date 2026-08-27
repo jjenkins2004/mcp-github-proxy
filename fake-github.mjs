@@ -34,6 +34,8 @@ function createStore() {
   const trees = new Map(); // sha -> [{path, mode, type:"blob", sha}] FLAT, paths relative to this tree
   const commits = new Map(); // sha -> {sha, message, tree, parents:[sha]}
   const repos = new Map(); // "owner/name" -> {name, owner, full_name, defaultBranch, permissions, empty, refs}
+  const owners = new Map(); // "login" -> "User" | "Organization"; absent means an unknown login
+  const collaborators = new Map(); // "owner/name" -> Set(login), beyond the owner themselves
   let seq = 0;
 
   const putBlob = (bytes) => {
@@ -195,6 +197,12 @@ function createStore() {
     putTree,
     putCommit,
     ensureRepo,
+    owners,
+    collaborators,
+    // What a given token can see: repos it owns, plus repos it collaborates on. Real GitHub
+    // decides this from the token; the fake needs the same shape or the roster proves nothing.
+    visibleTo: (login) =>
+      [...repos.values()].filter((r) => r.owner === login || (collaborators.get(r.full_name) || new Set()).has(login)),
     headSha,
     headCommit,
     resolveTree,
@@ -266,6 +274,9 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
 
     const segs = url.pathname.split("/").filter(Boolean).map((s) => decodeURIComponent(s));
     const method = req.method;
+    // Real GitHub reads the account behind POST /user/repos from the token. The seeded PATs are
+    // "pat-<login>", so the fake can do the same rather than being told out of band.
+    const tokenOwner = (r) => /^Bearer\s+pat-(.+)$/.exec(r.headers.authorization || "")?.[1] || null;
     const isPatchRef = method === "PATCH" && segs[3] === "git" && segs[4] === "refs";
 
     // Fault gate, consumed in the documented order.
@@ -290,11 +301,73 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
       return json(res, 401, { message: "Bad credentials" });
     }
 
+    // ---- account-level routes, before the /repos/:o/:r guard below ----
+
+    // GET /user — the account the PAT belongs to. POST /user/repos creates under THIS account,
+    // which is why create_repo checks it before creating anything.
+    if (method === "GET" && segs[0] === "user" && segs.length === 1) {
+      const login = tokenOwner(req);
+      if (!login) return json(res, 401, { message: "Bad credentials" });
+      return json(res, 200, { login, type: state.owners.get(login) || "User" });
+    }
+
+    // GET /user/repos — everything this token can see. Real GitHub's /users/:o/repos is
+    // public-only, which is why the server uses this one and filters by owner.
+    if (method === "GET" && segs[0] === "user" && segs[1] === "repos" && segs.length === 2) {
+      const login = tokenOwner(req);
+      if (!login) return json(res, 401, { message: "Bad credentials" });
+      const visible = state.visibleTo(login).map((r) => ({
+        name: r.name,
+        full_name: r.full_name,
+        private: !!r.private,
+        description: r.description ?? "",
+        default_branch: r.defaultBranch,
+        owner: { login: r.owner },
+      }));
+      const per = Number(url.searchParams.get("per_page") || 30);
+      const page = Number(url.searchParams.get("page") || 1);
+      return json(res, 200, visible.slice((page - 1) * per, page * per));
+    }
+
+    // POST /user/repos — creation, always under the account the token belongs to.
+    const createOwner = method === "POST" && segs[0] === "user" && segs[1] === "repos" && segs.length === 2 ? tokenOwner(req) : null;
+    if (createOwner) {
+      if (faults.has("403-create")) {
+        takeFault("403-create");
+        return json(res, 403, { message: "Resource not accessible by personal access token" });
+      }
+      const name = String(body?.name ?? "");
+      if (!name) return unprocessable(res, "Repository name is required");
+      const full = `${createOwner}/${name}`;
+      if (state.repos.has(full)) return unprocessable(res, "Repository creation failed: name already exists on this account");
+      const repo = state.ensureRepo(full);
+      // auto_init:false leaves the repo with no ref at all, which is what makes the server take
+      // its empty-repo bootstrap path.
+      repo.empty = !body?.auto_init;
+      repo.private = body?.private !== false;
+      repo.description = String(body?.description ?? "");
+      return json(res, 201, {
+        name: repo.name,
+        full_name: full,
+        private: repo.private,
+        description: repo.description,
+        default_branch: repo.defaultBranch,
+        html_url: `https://github.com/${full}`,
+      });
+    }
+
     if (segs[0] !== "repos" || segs.length < 3) return notFound(res);
     const full = `${segs[1]}/${segs[2]}`;
     const repo = state.repos.get(full);
     if (!repo) return notFound(res);
     const rest = segs.slice(3);
+
+    // Real GitHub cannot write git objects into a repository with no commits: blobs, trees,
+    // commits and refs all answer 409 "Git Repository is empty." The fake accepted them, which
+    // hid a bootstrap path that never worked against github.com.
+    if (method === "POST" && repo.empty && rest[0] === "git" && ["blobs", "trees", "commits"].includes(rest[1])) {
+      return json(res, 409, { message: "Git Repository is empty." });
+    }
 
     // 1. GET /repos/:o/:r
     if (method === "GET" && rest.length === 0) {
@@ -372,6 +445,28 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
     }
 
     // 2. GET /repos/:o/:r/contents/:path...
+    // PUT /repos/:o/:r/contents/:path — creates the branch and the initial commit in one request.
+    // The server uses it ONLY to bootstrap an empty repository.
+    if (method === "PUT" && rest[0] === "contents") {
+      const path = rest.slice(1).join("/");
+      const branch = body?.branch || repo.defaultBranch;
+      const head = state.headCommit(full, branch);
+      const existing = head ? state.treeEntries(head.tree).find((e) => e.path === path) : null;
+      if (existing && !body?.sha) return unprocessable(res, `"sha" wasn't supplied for ${path}`);
+      const blobSha = state.putBlob(Buffer.from(String(body?.content ?? ""), "base64"));
+      const merged = (head ? state.treeEntries(head.tree).filter((e) => e.path !== path) : []).concat([
+        { path, mode: "100644", type: "blob", sha: blobSha },
+      ]);
+      const tree = state.putTree(merged);
+      const commit = state.putCommit({ message: String(body?.message ?? ""), tree, parents: head ? [head.sha] : [] });
+      repo.refs.set(`heads/${branch}`, commit.sha);
+      repo.empty = false;
+      return json(res, 201, {
+        content: { path, sha: blobSha },
+        commit: { sha: commit.sha, message: commit.message, html_url: `https://github.com/${full}/commit/${commit.sha}` },
+      });
+    }
+
     if (method === "GET" && rest[0] === "contents") {
       const path = rest.slice(1).join("/");
       const ref = url.searchParams.get("ref") || repo.defaultBranch;
@@ -449,6 +544,10 @@ export function startFakeGitHub({ port = 8899, host = "127.0.0.1" } = {}) {
     if (rest[1] === "trees") {
       if (method === "GET" && rest.length >= 3) {
         const input = rest.slice(2).join("/"); // sha, commit sha, or branch name
+        // A repository with no commits has no tree to read either, and real GitHub says so with
+        // 409 rather than 404 — the difference decides whether this reads as "no files" or as a
+        // permissions problem.
+        if (repo.empty) return json(res, 409, { message: "Git Repository is empty." });
         const treeSha = state.resolveTree(full, input);
         if (!treeSha) return notFound(res);
         const recursive = url.searchParams.has("recursive") && url.searchParams.get("recursive") !== "0";
@@ -779,13 +878,21 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else {
     const gh = startFakeGitHub({ port: 8899 });
     await gh.ready;
-    gh.seed("acme/widgets", {
+    // A playground matching .env.fake: a token "pat-<login>" sees the repos <login> owns plus
+    // the ones <login> collaborates on, which is what the server's roster is built from.
+    gh.seed("alice/notes", {
       files: {
-        "README.md": "# widgets\n\nDemo repo served by fake-github.mjs.\n",
-        "docs/guide.md": "# guide\n\nstep one\n",
+        "INDEX.md": "# notes\n\nRouter for the notes project. Start here.\n\n## Where things live\n\n- `docs/` — guides\n",
+        "docs/guide.md": "# guide\n\nstep one\n\n## Install\n\nrun it\n",
         "src/index.ts": "export const hello = () => 'hi';\n",
       },
     });
-    console.log(`fake-github listening on ${gh.url} (seeded acme/widgets @ main)`);
+    gh.seed("alice/second", { files: { "INDEX.md": "# second\n\nA second project, with its own router.\n" } });
+    gh.seed("bob/wiki", { files: { "index.md": "# wiki\n\nbob's one repo\n" } });
+    for (const r of ["alice/notes", "alice/second"]) gh.state.collaborators.set(r, new Set(["frank"]));
+    for (const [full, d] of [["alice/notes", "the notes project"], ["alice/second", "a second project"], ["bob/wiki", "bob's wiki"]]) {
+      gh.state.repos.get(full).description = d;
+    }
+    console.log(`fake-github listening on ${gh.url} — alice/notes, alice/second, bob/wiki (frank collaborates on alice's)`);
   }
 }
