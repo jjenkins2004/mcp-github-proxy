@@ -254,18 +254,18 @@ Both people add the same URL; the secret each types binds their session to their
 
 ```bash
 npm install && npm run build
-node test-md.mjs        # 92 assertions: scanner, edit ops, byte fidelity — no network
+npm run test:unit       # 92 assertions: scanner, edit ops, byte fidelity — no network
 
-# integration: 264 assertions against a stateful fake GitHub
+# integration: 258 assertions against a stateful fake GitHub
 USER1_NAME=alice USER1_SECRET=secret-alice USER1_PAT=pat-alice \
 USER2_NAME=bob   USER2_SECRET=secret-bob   USER2_PAT=pat-bob \
 USER3_NAME=frank USER3_SECRET=secret-frank USER3_PAT=pat-frank \
 JWT_SECRET=test-jwt PUBLIC_URL=http://127.0.0.1:8787 PORT=8787 \
 GITHUB_API_URL=http://127.0.0.1:8899 npm start &
-node smoke.mjs
+npm run test:smoke
 ```
 
-`fake-github.mjs` is a stateful fake with a real git-blob-SHA implementation, a commit DAG,
+`tests/fake-github.mjs` is a stateful fake with a real git-blob-SHA implementation, a commit DAG,
 per-token repository visibility (owned plus collaborated-on, so name resolution proves something), a
 request log and injectable faults, so a commit made through the server is observable by a later
 read. It is what lets the suite assert the things that actually matter: that N edits produce

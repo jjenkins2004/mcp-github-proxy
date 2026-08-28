@@ -1,5 +1,5 @@
 // Unit tests for the pure markdown layer. Run: npm run build && node test-md.mjs
-import { deltaInvariants, editSection, parseDoc, render, scanHeadings, sectionSpan, strReplace } from "./dist/md.js";
+import { deltaInvariants, editSection, parseDoc, render, scanHeadings, sectionSpan, strReplace } from "../dist/md.js";
 
 let pass = 0;
 let fail = 0;

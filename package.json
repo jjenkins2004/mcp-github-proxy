@@ -3,11 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test:unit": "node tests/test-md.mjs",
+    "test:smoke": "node tests/smoke.mjs",
+    "fake": "node tests/fake-github.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
